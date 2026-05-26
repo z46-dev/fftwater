@@ -1,4 +1,4 @@
-module ocean3d
+module github.com/z46-dev/fftwater
 
 go 1.26
 
