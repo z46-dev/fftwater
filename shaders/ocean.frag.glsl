@@ -15,6 +15,8 @@ uniform vec3 cameraPosition;
 uniform float debugMode;
 uniform float environmentMode;
 uniform float time;
+uniform vec2 oceanRenderCenter;
+uniform float oceanRenderHalfSize;
 
 uniform vec3 uDeepColor;
 uniform vec3 uMidColor;
@@ -59,6 +61,17 @@ vec3 skyGradient(vec3 dir) {
     vec3 horizon = vec3(0.72, 0.80, 0.84) * day + vec3(1.00, 0.48, 0.25) * sunset + vec3(0.035, 0.055, 0.095) * night;
     vec3 zenith = vec3(0.35, 0.55, 0.72) * day + vec3(0.25, 0.23, 0.46) * sunset + vec3(0.006, 0.010, 0.030) * night;
     return mix(horizon, zenith, pow(y, 0.75));
+}
+
+vec3 horizonFogColor(vec3 dir) {
+    float sunset = step(0.5, environmentMode) * (1.0 - step(1.5, environmentMode));
+    float night = step(1.5, environmentMode);
+    float day = 1.0 - sunset - night;
+    float up = clamp(dir.y, 0.0, 1.0);
+
+    vec3 hazeColor = vec3(0.78, 0.84, 0.86) * day + vec3(0.95, 0.45, 0.25) * sunset + vec3(0.055, 0.070, 0.105) * night;
+    float haze = exp(-up * 10.0);
+    return mix(skyGradient(dir), hazeColor, haze * (day * 0.32 + sunset * 0.45 + night * 0.30));
 }
 
 float hash21(vec2 p) {
@@ -225,6 +238,17 @@ void main() {
     color += sunGlint;
     vec3 aeratedWater = mix(color, foamColor, foam * 0.68);
     color = mix(color, aeratedWater, clamp(foam * 0.82, 0.0, 1.0));
+
+    vec3 viewDir = normalize(fragWorldPos - cameraPosition);
+    float viewDistance = length(fragWorldPos - cameraPosition);
+    float distanceFog = smoothstep(1900.0, 5200.0, viewDistance);
+    float horizonFog = exp(-max(viewDir.y, 0.0) * 4.2);
+    float fog = clamp(distanceFog * mix(0.35, 0.82, horizonFog), 0.0, 0.82);
+    float edgeDistance = oceanRenderHalfSize - max(abs(fragWorldPos.x - oceanRenderCenter.x), abs(fragWorldPos.z - oceanRenderCenter.y));
+    float edgeFadeWidth = min(1400.0, oceanRenderHalfSize * 0.35);
+    float edgeFog = 1.0 - smoothstep(0.0, edgeFadeWidth, edgeDistance);
+    fog = max(fog, edgeFog);
+    color = mix(color, horizonFogColor(viewDir), fog);
 
     finalColor = vec4(tonemap(color), 1.0);
 }

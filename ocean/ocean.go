@@ -41,6 +41,10 @@ func New(cfg Config) (ocean *Ocean, err error) {
 		cfg.SizeMeters = 260
 	}
 
+	if cfg.RenderSizeMeters <= 0 {
+		cfg.RenderSizeMeters = cfg.SizeMeters * 8
+	}
+
 	if cfg.WindSpeed <= 0 {
 		cfg.WindSpeed = 10
 	}
@@ -68,6 +72,8 @@ func New(cfg Config) (ocean *Ocean, err error) {
 		timeUniform:              make([]float32, 1),
 		cascadeCountUniform:      make([]float32, 1),
 		renderGridSpacingUniform: make([]float32, 1),
+		renderCenterUniform:      make([]float32, 2),
+		renderHalfSizeUniform:    make([]float32, 1),
 		waterUniformValues:       makeWaterUniformValues(),
 		lastDebugMode:            -1,
 	}
@@ -143,9 +149,21 @@ func (ocean *Ocean) Size() (size float32) {
 	return
 }
 
-// Spacing returns the distance between adjacent vertices in world units.
+// RenderSize returns the width/depth of the camera-centered render mesh.
+func (ocean *Ocean) RenderSize() (size float32) {
+	size = ocean.cfg.RenderSizeMeters
+	return
+}
+
+// Spacing returns the FFT simulation spacing in world units.
 func (ocean *Ocean) Spacing() (spacing float32) {
 	spacing = ocean.cfg.SizeMeters / float32(ocean.cfg.N)
+	return
+}
+
+// RenderSpacing returns the distance between adjacent render mesh vertices in world units.
+func (ocean *Ocean) RenderSpacing() (spacing float32) {
+	spacing = ocean.cfg.RenderSizeMeters / float32(ocean.cfg.N)
 	return
 }
 
@@ -291,11 +309,11 @@ func (ocean *Ocean) generateInitialSpectrum() {
 	}
 }
 
-// buildMesh creates a static periodic ocean grid.
+// buildMesh creates a camera-centered ocean grid.
 // The vertex shader samples packed FFT textures to displace it at draw time.
 func (ocean *Ocean) buildMesh() (err error) {
 	var n int = ocean.cfg.N
-	ocean.mesh = rl.GenMeshPlane(ocean.cfg.SizeMeters, ocean.cfg.SizeMeters, n, n)
+	ocean.mesh = rl.GenMeshPlane(ocean.cfg.RenderSizeMeters, ocean.cfg.RenderSizeMeters, n, n)
 	return
 }
 
@@ -315,6 +333,8 @@ func (ocean *Ocean) loadMaterial() (err error) {
 	ocean.locTime = rl.GetShaderLocation(ocean.shader, "time")
 	ocean.locCascadeCount = rl.GetShaderLocation(ocean.shader, "cascadeCount")
 	ocean.locRenderGridSpacing = rl.GetShaderLocation(ocean.shader, "renderGridSpacing")
+	ocean.locRenderCenter = rl.GetShaderLocation(ocean.shader, "oceanRenderCenter")
+	ocean.locRenderHalfSize = rl.GetShaderLocation(ocean.shader, "oceanRenderHalfSize")
 	ocean.cacheWaterUniformLocations()
 	for i := range maxShaderCascades {
 		ocean.locCascadeHeightDisp[i] = rl.GetShaderLocation(ocean.shader, fmt.Sprintf("cascadeHeightDisp%d", i))
@@ -438,7 +458,7 @@ func periodicSampleIndex(x, z, n int) int {
 // which is used for computing the conjugate spectrum.
 func (ocean *Ocean) setCascadeShaderValues() {
 	ocean.cascadeCountUniform[0] = float32(len(ocean.cascades))
-	ocean.renderGridSpacingUniform[0] = ocean.Spacing()
+	ocean.renderGridSpacingUniform[0] = ocean.RenderSpacing()
 
 	setShaderFloat(ocean.shader, ocean.locCascadeCount, ocean.cascadeCountUniform)
 	setShaderFloat(ocean.shader, ocean.locRenderGridSpacing, ocean.renderGridSpacingUniform)
@@ -690,22 +710,25 @@ func (ocean *Ocean) Draw(debugMode int32, cameraPos rl.Vector3) {
 		ocean.lastDebugMode = debugMode
 	}
 
-	// Draw a 3x3 set of periodic FFT patches around the camera.
-	// This keeps the boilerplate navigable without implementing real clipmaps yet.
 	var (
-		size             = ocean.cfg.SizeMeters
-		centerX, centerZ = float32(math.Floor(float64(cameraPos.X/size))) * size, float32(math.Floor(float64(cameraPos.Z/size))) * size
+		spacing          = ocean.RenderSpacing()
+		centerX, centerZ = float32(math.Floor(float64(cameraPos.X/spacing))) * spacing, float32(math.Floor(float64(cameraPos.Z/spacing))) * spacing
+		transform        = rl.MatrixTranslate(centerX, 0, centerZ)
 	)
 
-	for dz := -1; dz <= 1; dz++ {
-		for dx := -1; dx <= 1; dx++ {
-			var (
-				x, z      float32   = centerX + float32(dx)*size, centerZ + float32(dz)*size
-				transform rl.Matrix = rl.MatrixTranslate(x, 0, z)
-			)
+	ocean.renderCenterUniform[0] = centerX
+	ocean.renderCenterUniform[1] = centerZ
+	ocean.renderHalfSizeUniform[0] = ocean.cfg.RenderSizeMeters * 0.5
 
-			rl.DrawMesh(ocean.mesh, ocean.material, transform)
-		}
+	setShaderVec2(ocean.shader, ocean.locRenderCenter, ocean.renderCenterUniform)
+	setShaderFloat(ocean.shader, ocean.locRenderHalfSize, ocean.renderHalfSizeUniform)
+
+	rl.DrawMesh(ocean.mesh, ocean.material, transform)
+}
+
+func setShaderVec2(shader rl.Shader, loc int32, value []float32) {
+	if loc >= 0 {
+		rl.SetShaderValue(shader, loc, value, rl.ShaderUniformVec2)
 	}
 }
 

@@ -62,6 +62,7 @@ func main() {
 	if sea, err = ocean.New(ocean.Config{
 		N:                128,
 		SizeMeters:       512,
+		RenderSizeMeters: 8192,
 		WindDirection:    rl.NewVector2(1.0, 0.28),
 		WindSpeed:        10.5,
 		Amplitude:        150,
@@ -207,7 +208,7 @@ func drawHUD(debugMode int32, paused bool, timeScale float32, sea *ocean.Ocean, 
 	rl.DrawText("1 shaded | 2 height | 3 slope | 4 normals | 5 foam | 6 day | 7 sunset | 8 night | Space pause | [/] time | R reset", 8, y, 16, rl.NewColor(35, 45, 50, 255))
 	y += 22
 
-	rl.DrawText(fmt.Sprintf("FFT grid %dx%d | cascades %d | size %.0fm | %.1fm spacing | camera %.1f %.1f %.1f", sea.N(), sea.N(), sea.CascadeCount(), sea.Size(), sea.Spacing(), cam.Position().X, cam.Position().Y, cam.Position().Z), 8, y, 16, rl.NewColor(35, 45, 50, 255))
+	rl.DrawText(fmt.Sprintf("FFT grid %dx%d | cascades %d | patch %.0fm | render %.0fm | %.1fm spacing | camera %.1f %.1f %.1f", sea.N(), sea.N(), sea.CascadeCount(), sea.Size(), sea.RenderSize(), sea.RenderSpacing(), cam.Position().X, cam.Position().Y, cam.Position().Z), 8, y, 16, rl.NewColor(35, 45, 50, 255))
 }
 
 // Debug

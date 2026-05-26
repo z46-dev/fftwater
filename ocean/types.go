@@ -9,6 +9,11 @@ type Config struct {
 	// SizeMeters is the width/depth of the periodic FFT patch in world units.
 	SizeMeters float32
 
+	// RenderSizeMeters is the width/depth of the camera-centered ocean mesh.
+	// It can be much larger than SizeMeters because the shader samples the
+	// periodic FFT cascades in world space.
+	RenderSizeMeters float32
+
 	// WindDirection controls the Phillips spectrum. It is normalized internally.
 	WindDirection rl.Vector2
 
@@ -89,12 +94,13 @@ type Ocean struct {
 	kx, kz, kLen, omega                                       []float64
 	locSunDir, locCameraPos, locDebugMode, locCascadeCount    int32
 	locEnvironmentMode, locTime                               int32
-	locRenderGridSpacing                                      int32
+	locRenderGridSpacing, locRenderCenter, locRenderHalfSize  int32
 	locCascadeHeightDisp, locCascadeSlopeFold, locCascadeSize [maxShaderCascades]int32
 	waterUniforms                                             waterUniformLocations
 	sunDirUniform, cameraPosUniform, debugModeUniform         []float32
 	environmentModeUniform, timeUniform                       []float32
 	cascadeCountUniform, renderGridSpacingUniform             []float32
+	renderCenterUniform, renderHalfSizeUniform                []float32
 	cascadeSizeUniforms                                       [maxShaderCascades][]float32
 	waterUniformValues                                        waterUniformValues
 	lastUpdateTime                                            float32

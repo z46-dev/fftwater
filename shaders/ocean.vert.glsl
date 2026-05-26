@@ -6,6 +6,7 @@ in vec2 vertexTexCoord;
 
 uniform mat4 mvp;
 uniform mat4 matModel;
+uniform float time;
 uniform float cascadeCount;
 uniform float cascadeSize0;
 uniform float cascadeSize1;
@@ -104,23 +105,85 @@ vec3 sampleTotalSlopeFold(vec2 p) {
     return total;
 }
 
-vec3 normalFromSlopeTextures(vec2 p) {
-    vec2 slope = sampleTotalSlopeFold(p).xy;
-    return normalize(vec3(-slope.x, 1.0, -slope.y));
+vec2 rotate2(vec2 v, float angle) {
+    float c = cos(angle);
+    float s = sin(angle);
+    return vec2(c * v.x - s * v.y, s * v.x + c * v.y);
+}
+
+vec4 sampleLayerHeightDisp(vec2 p, float scale, float angle, vec2 offset) {
+    vec4 hd = sampleTotalHeightDisp(rotate2(p, angle) * scale + offset);
+    hd.gb = rotate2(hd.gb, -angle);
+    return hd;
+}
+
+vec3 sampleLayerSlopeFold(vec2 p, float scale, float angle, vec2 offset) {
+    vec3 sf = sampleTotalSlopeFold(rotate2(p, angle) * scale + offset);
+    sf.xy = rotate2(sf.xy, -angle) * scale;
+    return sf;
+}
+
+float macroSwellHeight(vec2 p) {
+    float t = time * 0.08;
+    float a = sin(dot(p, normalize(vec2(0.86, 0.51))) * 0.0021 + t);
+    float b = sin(dot(p, normalize(vec2(-0.38, 0.92))) * 0.0014 - t * 0.73 + 1.7);
+    float c = sin(dot(p, normalize(vec2(0.21, -0.98))) * 0.0032 + t * 1.21 + 4.1);
+    return (a * 0.85 + b * 0.65 + c * 0.28) * 0.42;
+}
+
+vec2 geometryDomainWarp(vec2 p) {
+    float t = time * 0.035;
+    float x = sin(dot(p, vec2(0.0017, 0.0009)) + t) + sin(dot(p, vec2(-0.0008, 0.0013)) - t * 1.31 + 2.4);
+    float z = sin(dot(p, vec2(0.0011, -0.0015)) - t * 0.83 + 4.6) + sin(dot(p, vec2(0.0006, 0.0019)) + t * 1.17);
+    return vec2(x, z) * 58.0;
+}
+
+vec2 macroSwellSlope(vec2 p) {
+    float t = time * 0.08;
+    vec2 d0 = normalize(vec2(0.86, 0.51));
+    vec2 d1 = normalize(vec2(-0.38, 0.92));
+    vec2 d2 = normalize(vec2(0.21, -0.98));
+    vec2 slope = vec2(0.0);
+    slope += d0 * cos(dot(p, d0) * 0.0021 + t) * 0.0021 * 0.85;
+    slope += d1 * cos(dot(p, d1) * 0.0014 - t * 0.73 + 1.7) * 0.0014 * 0.65;
+    slope += d2 * cos(dot(p, d2) * 0.0032 + t * 1.21 + 4.1) * 0.0032 * 0.28;
+    return slope * 0.42;
+}
+
+vec4 sampleAntiTiledHeightDisp(vec2 p) {
+    vec4 a = sampleLayerHeightDisp(p, 1.0, 0.0, vec2(0.0));
+    vec4 b = sampleLayerHeightDisp(p, 0.731, 0.74, vec2(117.0, -283.0));
+    vec4 c = sampleLayerHeightDisp(p, 1.337, -1.18, vec2(-421.0, 199.0));
+    vec4 total = a * 0.70 + b * 0.22 + c * 0.08;
+    total.r += macroSwellHeight(p);
+    total.a = min(a.a, min(b.a, c.a));
+    return total;
+}
+
+vec3 sampleAntiTiledSlopeFold(vec2 p) {
+    vec3 a = sampleLayerSlopeFold(p, 1.0, 0.0, vec2(0.0));
+    vec3 b = sampleLayerSlopeFold(p, 0.731, 0.74, vec2(117.0, -283.0));
+    vec3 c = sampleLayerSlopeFold(p, 1.337, -1.18, vec2(-421.0, 199.0));
+    vec3 total = a * 0.70 + b * 0.22 + c * 0.08;
+    total.xy += macroSwellSlope(p);
+    total.z = max(a.z, max(b.z * 0.65, c.z * 0.45));
+    return total;
 }
 
 float curvatureFromSlope(vec2 p) {
     float eps = max(renderGridSpacing * 0.75, 0.25);
-    vec2 slopeR = sampleTotalSlopeFold(p + vec2(eps, 0.0)).xy;
-    vec2 slopeL = sampleTotalSlopeFold(p - vec2(eps, 0.0)).xy;
-    vec2 slopeU = sampleTotalSlopeFold(p + vec2(0.0, eps)).xy;
-    vec2 slopeD = sampleTotalSlopeFold(p - vec2(0.0, eps)).xy;
+    vec2 slopeR = sampleAntiTiledSlopeFold(p + vec2(eps, 0.0)).xy;
+    vec2 slopeL = sampleAntiTiledSlopeFold(p - vec2(eps, 0.0)).xy;
+    vec2 slopeU = sampleAntiTiledSlopeFold(p + vec2(0.0, eps)).xy;
+    vec2 slopeD = sampleAntiTiledSlopeFold(p - vec2(0.0, eps)).xy;
     return ((slopeR.x - slopeL.x) + (slopeU.y - slopeD.y)) / (2.0 * eps);
 }
 
 void main() {
-    vec4 heightDisp = sampleTotalHeightDisp(vertexPosition.xz);
-    vec3 slopeFold = sampleTotalSlopeFold(vertexPosition.xz);
+    vec4 baseWorld = matModel * vec4(vertexPosition, 1.0);
+    vec2 waveSamplePos = baseWorld.xz + geometryDomainWarp(baseWorld.xz);
+    vec4 heightDisp = sampleAntiTiledHeightDisp(waveSamplePos);
+    vec3 slopeFold = sampleAntiTiledSlopeFold(waveSamplePos);
     vec3 displaced = vertexPosition + vec3(heightDisp.g, heightDisp.r, heightDisp.b);
     vec3 normal = normalize(vec3(-slopeFold.x, 1.0, -slopeFold.y));
 
@@ -131,7 +194,7 @@ void main() {
     fragHeight = displaced.y;
     fragSlope = slopeFold.xy;
     fragSlopeMagnitude = length(slopeFold.xy);
-    fragCurvature = -curvatureFromSlope(vertexPosition.xz);
+    fragCurvature = -curvatureFromSlope(waveSamplePos);
     fragJacobian = heightDisp.a;
     fragFolding = slopeFold.z;
     gl_Position = mvp * vec4(displaced, 1.0);
