@@ -7,9 +7,9 @@ import (
 
 	rl "github.com/gen2brain/raylib-go/raylib"
 
-	"ocean3d/camera"
-	"ocean3d/ocean"
-	"ocean3d/sky"
+	"github.com/z46-dev/fftwater/camera"
+	"github.com/z46-dev/fftwater/ocean"
+	"github.com/z46-dev/fftwater/sky"
 )
 
 const (
