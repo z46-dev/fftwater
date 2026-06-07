@@ -20,7 +20,7 @@ const (
 	hudX      = 16
 	hudY      = 16
 	hudWidth  = 640
-	hudHeight = 118
+	hudHeight = 166
 )
 
 type mouseLookAccumulator struct {
@@ -62,6 +62,8 @@ func Run(log *golog.Logger) error {
 		start         time.Time = time.Now()
 		look          mouseLookAccumulator
 		ctx           *gctx2d.Context
+		cam           *WaterCamera = NewWaterCamera()
+		renderer      *WaterRenderer
 		pointerSource gpucontext.PointerEventSource
 		ok            bool
 	)
@@ -89,12 +91,12 @@ func Run(log *golog.Logger) error {
 			gpuApp.SetCursorMode(gpucontext.CursorModeNormal)
 		}
 
-		// var dx, dy float32
-		// if dx, dy = look.Take(); dx != 0 || dy != 0 {
-		// 	cam.ApplyLookDelta(dx, dy)
-		// }
+		var dx, dy float32
+		if dx, dy = look.Take(); dx != 0 || dy != 0 {
+			cam.ApplyLookDelta(dx, dy)
+		}
 
-		// cam.Update(float32(dt), in)
+		cam.Update(float32(dt), in)
 	})
 
 	var (
@@ -143,29 +145,29 @@ func Run(log *golog.Logger) error {
 			height = startHeight
 		}
 
-		// var aspect float32 = float32(width) / float32(height)
+		var (
+			elapsed float64 = time.Since(start).Seconds()
+			aspect  float32 = float32(width) / float32(height)
+		)
 
-		// if renderer == nil {
-		// 	if renderer, err = NewRenderer(provider.Device(), provider.SurfaceFormat()); err != nil {
-		// 		log.Panicf("create ocean renderer: %v", err)
-		// 	}
+		if renderer == nil {
+			if renderer, err = NewWaterRenderer(provider.Device(), provider.SurfaceFormat()); err != nil {
+				log.Panicf("create water renderer: %v", err)
+			}
 
-		// 	log.Infof("GoGPU backend: %s\n", dc.Backend())
-		// }
+			log.Infof("GoGPU backend: %s", dc.Backend())
+		}
+
+		if err = renderer.Draw(finalSurface, NewWaterFrame(surfaceW, surfaceH, float32(elapsed), aspect, cam)); err != nil {
+			log.Errorf("draw water: %v", err)
+			return
+		}
 
 		if !ensure2DContext(provider) {
 			return
 		}
 
-		// if err = renderer.Draw(finalSurface, FrameUniformsFromCamera(cam, aspect, float32(time.Since(start).Seconds()))); err != nil {
-		// 	log.Errorf("draw ocean: %v", err)
-		// 	return
-		// }
-
-		var (
-			gpuName string = gpuApp.GPUContextProvider().AdapterInfo().Name
-			elapsed        = time.Since(start).Seconds()
-		)
+		var gpuName string = gpuApp.GPUContextProvider().AdapterInfo().Name
 
 		ctx.Begin(width, height)
 		ctx.BeginPath()
@@ -182,8 +184,10 @@ func Run(log *golog.Logger) error {
 		ctx.SetFillStyle(gctx2d.ColorWhite)
 		ctx.FillText(fmt.Sprintf("FPS: %d", fps), hudX+12, hudY+28)
 		ctx.FillText("GPU: "+gpuName, hudX+12, hudY+52)
-		// ctx.FillText(fmt.Sprintf("Cam: %.1f %.1f %.1f", cam.Position.X, cam.Position.Y, cam.Position.Z), hudX+12, hudY+76)
-		ctx.FillText(fmt.Sprintf("Time: %.2fs", elapsed), hudX+12, hudY+100)
+		ctx.FillText("Water: projected grid fixed + spectral Gerstner checkpoint", hudX+12, hudY+76)
+		ctx.FillText(fmt.Sprintf("Cam: %.1f %.1f %.1f", cam.Position.X, cam.Position.Y, cam.Position.Z), hudX+12, hudY+100)
+		ctx.FillText(fmt.Sprintf("Time: %.2fs", elapsed), hudX+12, hudY+124)
+		ctx.FillText("Move: WASD + QE, hold RMB to look. Next: FFT spectrum textures", hudX+12, hudY+148)
 
 		if err = ctx.Flush(finalSurface, nil); err != nil {
 			log.Errorf("flush 2D HUD overlay: %v", err)
@@ -204,10 +208,10 @@ func Run(log *golog.Logger) error {
 			ctx = nil
 		}
 
-		// if renderer != nil {
-		// 	renderer.Release()
-		// 	renderer = nil
-		// }
+		if renderer != nil {
+			renderer.Release()
+			renderer = nil
+		}
 	})
 
 	return gpuApp.Run()
