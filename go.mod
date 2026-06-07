@@ -3,7 +3,6 @@ module github.com/z46-dev/fftwater
 go 1.26.2
 
 require (
-	github.com/gogpu/gg v0.48.7
 	github.com/gogpu/gogpu v0.41.6
 	github.com/gogpu/gpucontext v0.19.0
 	github.com/gogpu/gputypes v0.5.0
@@ -14,7 +13,6 @@ require (
 
 require (
 	github.com/flopp/go-findfont v0.1.0 // indirect
-	github.com/go-text/typesetting v0.3.4 // indirect
 	github.com/go-webgpu/goffi v0.5.3 // indirect
 	github.com/go-webgpu/webgpu v0.5.2 // indirect
 	github.com/gogpu/naga v0.17.13 // indirect

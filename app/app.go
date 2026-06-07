@@ -23,13 +23,13 @@ const (
 	hudHeight = 166
 )
 
-type mouseLookAccumulator struct {
+type inputDeltaAccumulator struct {
 	mu sync.Mutex
 	x  float32
 	y  float32
 }
 
-func (a *mouseLookAccumulator) Add(dx, dy float32) {
+func (a *inputDeltaAccumulator) Add(dx, dy float32) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -37,7 +37,7 @@ func (a *mouseLookAccumulator) Add(dx, dy float32) {
 	a.y += dy
 }
 
-func (a *mouseLookAccumulator) Take() (dx, dy float32) {
+func (a *inputDeltaAccumulator) Take() (dx, dy float32) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -60,11 +60,13 @@ func Run(log *golog.Logger) error {
 		)
 
 		start         time.Time = time.Now()
-		look          mouseLookAccumulator
+		look          inputDeltaAccumulator
+		scroll        inputDeltaAccumulator
 		ctx           *gctx2d.Context
 		cam           *WaterCamera = NewWaterCamera()
 		renderer      *WaterRenderer
 		pointerSource gpucontext.PointerEventSource
+		scrollSource  interface{ OnScroll(func(float64, float64)) }
 		ok            bool
 	)
 
@@ -82,6 +84,12 @@ func Run(log *golog.Logger) error {
 		})
 	}
 
+	if scrollSource, ok = gpuApp.EventSource().(interface{ OnScroll(func(float64, float64)) }); ok {
+		scrollSource.OnScroll(func(dx, dy float64) {
+			scroll.Add(float32(dx), float32(dy))
+		})
+	}
+
 	gpuApp.OnUpdate(func(dt float64) {
 		var in = gpuApp.Input()
 
@@ -94,6 +102,16 @@ func Run(log *golog.Logger) error {
 		var dx, dy float32
 		if dx, dy = look.Take(); dx != 0 || dy != 0 {
 			cam.ApplyLookDelta(dx, dy)
+		}
+
+		var scrollY float32
+		if _, scrollY = scroll.Take(); scrollY != 0 {
+			fastZoom := false
+			if in != nil {
+				keyboard := in.Keyboard()
+				fastZoom = keyboard.Pressed(input.KeyShiftLeft) || keyboard.Pressed(input.KeyShiftRight)
+			}
+			cam.ApplyZoomScroll(-scrollY, fastZoom)
 		}
 
 		cam.Update(float32(dt), in)
@@ -184,10 +202,10 @@ func Run(log *golog.Logger) error {
 		ctx.SetFillStyle(gctx2d.ColorWhite)
 		ctx.FillText(fmt.Sprintf("FPS: %d", fps), hudX+12, hudY+28)
 		ctx.FillText("GPU: "+gpuName, hudX+12, hudY+52)
-		ctx.FillText("Water: projected grid fixed + spectral Gerstner checkpoint", hudX+12, hudY+76)
+		ctx.FillText("Water: raw spectral field -> filtered field -> projected grid", hudX+12, hudY+76)
 		ctx.FillText(fmt.Sprintf("Cam: %.1f %.1f %.1f", cam.Position.X, cam.Position.Y, cam.Position.Z), hudX+12, hudY+100)
 		ctx.FillText(fmt.Sprintf("Time: %.2fs", elapsed), hudX+12, hudY+124)
-		ctx.FillText("Move: WASD + QE, hold RMB to look. Next: FFT spectrum textures", hudX+12, hudY+148)
+		ctx.FillText("Move: WASD, wheel zooms, Shift accelerates. Hold RMB to look", hudX+12, hudY+148)
 
 		if err = ctx.Flush(finalSurface, nil); err != nil {
 			log.Errorf("flush 2D HUD overlay: %v", err)

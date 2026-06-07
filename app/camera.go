@@ -7,15 +7,17 @@ import (
 )
 
 const (
-	waterCameraMoveSpeed    float32 = 36.0
-	waterCameraLookScale    float32 = 0.0025
-	waterCameraMinPitch     float32 = -1.35
-	waterCameraMaxPitch     float32 = 0.08
-	waterCameraDefaultFOV   float32 = 62.0 * math.Pi / 180.0
-	waterCameraDefaultNear  float32 = 0.25
-	waterCameraDefaultFar   float32 = 2400.0
-	waterCameraDefaultYaw   float32 = 0.0
-	waterCameraDefaultPitch float32 = -0.24
+	waterCameraMoveSpeed       float32 = 36.0
+	waterCameraLookScale       float32 = 0.0025
+	waterCameraScrollZoomStep  float32 = 10.0
+	waterCameraScrollShiftGain float32 = 3.0
+	waterCameraMinPitch        float32 = -1.35
+	waterCameraMaxPitch        float32 = 0.08
+	waterCameraDefaultFOV      float32 = 62.0 * math.Pi / 180.0
+	waterCameraDefaultNear     float32 = 0.25
+	waterCameraDefaultFar      float32 = 65000.0
+	waterCameraDefaultYaw      float32 = 0.0
+	waterCameraDefaultPitch    float32 = -0.24
 )
 
 type Vec3 struct {
@@ -91,6 +93,26 @@ func (c *WaterCamera) ApplyLookDelta(dx, dy float32) {
 	c.Pitch = clamp32(c.Pitch-dy*waterCameraLookScale, waterCameraMinPitch, waterCameraMaxPitch)
 }
 
+func (c *WaterCamera) ApplyZoomScroll(delta float32, fast bool) {
+	if c == nil || delta == 0 {
+		return
+	}
+
+	forward, _, _ := c.Basis()
+	mag := float32(math.Log1p(math.Abs(float64(delta))))
+	if delta < 0 {
+		mag = -mag
+	}
+
+	step := waterCameraScrollZoomStep
+	if fast {
+		step *= waterCameraScrollShiftGain
+	}
+
+	c.Position = c.Position.Add(forward.Mul(mag * step))
+	c.clampAboveWater()
+}
+
 func (c *WaterCamera) Basis() (forward, right, up Vec3) {
 	cy := float32(math.Cos(float64(c.Yaw)))
 	sy := float32(math.Sin(float64(c.Yaw)))
@@ -126,12 +148,6 @@ func (c *WaterCamera) Update(dt float32, in *input.State) {
 	if keyboard.Pressed(input.KeyA) || keyboard.Pressed(input.KeyLeft) {
 		move = move.Sub(flatRight)
 	}
-	if keyboard.Pressed(input.KeyE) || keyboard.Pressed(input.KeySpace) {
-		move.Y += 1
-	}
-	if keyboard.Pressed(input.KeyQ) || keyboard.Pressed(input.KeyControlLeft) || keyboard.Pressed(input.KeyControlRight) {
-		move.Y -= 1
-	}
 
 	if dot3(move, move) > 0.0001 {
 		move = normalize3(move)
@@ -143,6 +159,10 @@ func (c *WaterCamera) Update(dt float32, in *input.State) {
 	}
 
 	c.Position = c.Position.Add(move.Mul(speed * dt))
+	c.clampAboveWater()
+}
+
+func (c *WaterCamera) clampAboveWater() {
 	if c.Position.Y < 2.0 {
 		c.Position.Y = 2.0
 	}
