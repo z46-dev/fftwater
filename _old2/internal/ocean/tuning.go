@@ -56,7 +56,7 @@ func CalmTuning() OceanTuning {
 		ChopScale:         0.52,
 		TimeScale:         0.46,
 		NormalDetailScale: 1.20,
-		FoamAmount:        0.14,
+		FoamAmount:        0.16,
 		FoamThreshold:     0.62,
 		ReflectionAmount:  0.26,
 		Roughness:         0.46,
@@ -71,35 +71,35 @@ func CalmTuning() OceanTuning {
 
 func WoWSTuning() OceanTuning {
 	return OceanTuning{
-		// 1/2/7/9: dark, reflective, chop-driven water. White is reserved for sparse
-		// foam/specular; ordinary water stays in a narrow steel-blue range.
-		HeightScale:       1.02,
-		ChopScale:         1.18,
-		TimeScale:         0.78,
-		NormalDetailScale: 2.20,
-		FoamAmount:        0.18,
-		FoamThreshold:     0.20,
-		ReflectionAmount:  0.22,
-		Roughness:         0.64,
+		// WoWS-style baseline: restrained vertical relief, dense normal/slope detail.
+		// The water should read as many small reflected facets, not tall rolling hills.
+		HeightScale:       1.32,
+		ChopScale:         1.30,
+		TimeScale:         1.38,
+		NormalDetailScale: 3.15,
+		FoamAmount:        0.022,
+		FoamThreshold:     0.76,
+		ReflectionAmount:  0.64,
+		Roughness:         0.58,
 
-		WindSpeed:        9.8,
+		WindSpeed:        10.8,
 		WindDirectionX:   0.89,
 		WindDirectionZ:   0.46,
-		SpectrumScale:    1.00,
-		ShortWaveDamping: 0.00024,
+		SpectrumScale:    0.96,
+		ShortWaveDamping: 0.00016,
 	}
 }
 
 func RoughTuning() OceanTuning {
 	return OceanTuning{
-		HeightScale:       1.12,
-		ChopScale:         1.28,
-		TimeScale:         0.66,
-		NormalDetailScale: 2.50,
+		HeightScale:       1.34,
+		ChopScale:         1.36,
+		TimeScale:         0.70,
+		NormalDetailScale: 2.85,
 		FoamAmount:        0.40,
 		FoamThreshold:     0.22,
-		ReflectionAmount:  0.24,
-		Roughness:         0.60,
+		ReflectionAmount:  0.28,
+		Roughness:         0.58,
 
 		WindSpeed:        10.8,
 		WindDirectionX:   0.89,
@@ -147,7 +147,7 @@ func (t OceanTuning) SpectrumConfig(seed int64) SpectrumConfig {
 		WindSpeed:        float64(t.WindSpeed),
 		WindDirectionX:   float64(t.WindDirectionX),
 		WindDirectionZ:   float64(t.WindDirectionZ),
-		Amplitude:        float64(4.45e-3 * t.SpectrumScale),
+		Amplitude:        float64(5.35e-3 * t.SpectrumScale),
 		ShortWaveDamping: float64(t.ShortWaveDamping),
 		Seed:             seed,
 	}

@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/z46-dev/fftwater/app"
+	"github.com/z46-dev/fftwater/internal/app"
 	"github.com/z46-dev/golog"
 )
 

@@ -21,14 +21,17 @@ const (
 )
 
 const (
-	oceanSampleSize     uint64  = 48
-	spectrumSampleSize  uint64  = 32
-	fftSampleSize       uint64  = 8
-	fieldMapSampleSize  uint64  = 32
-	spectrumResolution  uint32  = 128
-	heightWorkgroupSize uint32  = 64
-	fftHeightScale      float32 = 320.0
-	defaultSpectrumSeed int64   = 42
+	oceanSampleSize        uint64  = 48
+	waveLayerSampleSize    uint64  = 64
+	foamLayerSampleSize    uint64  = 48
+	opticalLayerSampleSize uint64  = 64
+	spectrumSampleSize     uint64  = 32
+	fftSampleSize          uint64  = 8
+	fieldMapSampleSize     uint64  = 32
+	spectrumResolution     uint32  = 128
+	heightWorkgroupSize    uint32  = 64
+	fftHeightScale         float32 = 320.0
+	defaultSpectrumSeed    int64   = 42
 )
 
 type FrameUniforms struct {
@@ -42,6 +45,9 @@ type Renderer struct {
 	fftABuf, fftBBuf                *wgpu.Buffer
 	fieldMapBuf                     *wgpu.Buffer
 	heightBuf                       *wgpu.Buffer
+	waveLayerBuf                    *wgpu.Buffer
+	foamLayerBuf                    *wgpu.Buffer
+	opticalLayerBuf                 *wgpu.Buffer
 
 	renderBindLayout  *wgpu.BindGroupLayout
 	computeBindLayout *wgpu.BindGroupLayout
@@ -180,6 +186,9 @@ func NewRenderer(dev *wgpu.Device, format gputypes.TextureFormat) (r *Renderer, 
 
 	totalCascadeSamples := uint64(cascadeCount) * uint64(spectrumResolution*spectrumResolution)
 	heightBufSize := uint64(r.vertexCount) * oceanSampleSize
+	waveLayerBufSize := uint64(r.vertexCount) * waveLayerSampleSize
+	foamLayerBufSize := uint64(r.vertexCount) * foamLayerSampleSize
+	opticalLayerBufSize := uint64(r.vertexCount) * opticalLayerSampleSize
 	spectrumBufSize := totalCascadeSamples * spectrumSampleSize
 	fftBufSize := totalCascadeSamples * fftSampleSize
 	fieldMapSize := totalCascadeSamples * fieldMapSampleSize
@@ -187,6 +196,30 @@ func NewRenderer(dev *wgpu.Device, format gputypes.TextureFormat) (r *Renderer, 
 	if r.heightBuf, err = dev.CreateBuffer(&wgpu.BufferDescriptor{
 		Label: "ocean height samples",
 		Size:  heightBufSize,
+		Usage: wgpu.BufferUsageStorage,
+	}); err != nil {
+		return
+	}
+
+	if r.waveLayerBuf, err = dev.CreateBuffer(&wgpu.BufferDescriptor{
+		Label: "water wave layer samples",
+		Size:  waveLayerBufSize,
+		Usage: wgpu.BufferUsageStorage,
+	}); err != nil {
+		return
+	}
+
+	if r.foamLayerBuf, err = dev.CreateBuffer(&wgpu.BufferDescriptor{
+		Label: "water foam layer samples",
+		Size:  foamLayerBufSize,
+		Usage: wgpu.BufferUsageStorage,
+	}); err != nil {
+		return
+	}
+
+	if r.opticalLayerBuf, err = dev.CreateBuffer(&wgpu.BufferDescriptor{
+		Label: "water optical layer samples",
+		Size:  opticalLayerBufSize,
 		Usage: wgpu.BufferUsageStorage,
 	}); err != nil {
 		return
@@ -246,6 +279,30 @@ func NewRenderer(dev *wgpu.Device, format gputypes.TextureFormat) (r *Renderer, 
 					MinBindingSize: heightBufSize,
 				},
 			},
+			{
+				Binding:    2,
+				Visibility: wgpu.ShaderStageVertex | wgpu.ShaderStageFragment,
+				Buffer: &gputypes.BufferBindingLayout{
+					Type:           gputypes.BufferBindingTypeReadOnlyStorage,
+					MinBindingSize: waveLayerBufSize,
+				},
+			},
+			{
+				Binding:    3,
+				Visibility: wgpu.ShaderStageVertex | wgpu.ShaderStageFragment,
+				Buffer: &gputypes.BufferBindingLayout{
+					Type:           gputypes.BufferBindingTypeReadOnlyStorage,
+					MinBindingSize: foamLayerBufSize,
+				},
+			},
+			{
+				Binding:    4,
+				Visibility: wgpu.ShaderStageVertex | wgpu.ShaderStageFragment,
+				Buffer: &gputypes.BufferBindingLayout{
+					Type:           gputypes.BufferBindingTypeReadOnlyStorage,
+					MinBindingSize: opticalLayerBufSize,
+				},
+			},
 		},
 	}); err != nil {
 		return
@@ -301,6 +358,30 @@ func NewRenderer(dev *wgpu.Device, format gputypes.TextureFormat) (r *Renderer, 
 					MinBindingSize: fieldMapSize,
 				},
 			},
+			{
+				Binding:    6,
+				Visibility: wgpu.ShaderStageCompute,
+				Buffer: &gputypes.BufferBindingLayout{
+					Type:           gputypes.BufferBindingTypeStorage,
+					MinBindingSize: waveLayerBufSize,
+				},
+			},
+			{
+				Binding:    7,
+				Visibility: wgpu.ShaderStageCompute,
+				Buffer: &gputypes.BufferBindingLayout{
+					Type:           gputypes.BufferBindingTypeStorage,
+					MinBindingSize: foamLayerBufSize,
+				},
+			},
+			{
+				Binding:    8,
+				Visibility: wgpu.ShaderStageCompute,
+				Buffer: &gputypes.BufferBindingLayout{
+					Type:           gputypes.BufferBindingTypeStorage,
+					MinBindingSize: opticalLayerBufSize,
+				},
+			},
 		},
 	}); err != nil {
 		return
@@ -311,6 +392,9 @@ func NewRenderer(dev *wgpu.Device, format gputypes.TextureFormat) (r *Renderer, 
 		Entries: []wgpu.BindGroupEntry{
 			{Binding: 0, Buffer: r.uniformBuf, Size: frameUniformSize},
 			{Binding: 1, Buffer: r.heightBuf, Size: heightBufSize},
+			{Binding: 2, Buffer: r.waveLayerBuf, Size: waveLayerBufSize},
+			{Binding: 3, Buffer: r.foamLayerBuf, Size: foamLayerBufSize},
+			{Binding: 4, Buffer: r.opticalLayerBuf, Size: opticalLayerBufSize},
 		},
 	}); err != nil {
 		return
@@ -325,6 +409,9 @@ func NewRenderer(dev *wgpu.Device, format gputypes.TextureFormat) (r *Renderer, 
 			{Binding: 3, Buffer: r.fftABuf, Size: fftBufSize},
 			{Binding: 4, Buffer: r.fftBBuf, Size: fftBufSize},
 			{Binding: 5, Buffer: r.fieldMapBuf, Size: fieldMapSize},
+			{Binding: 6, Buffer: r.waveLayerBuf, Size: waveLayerBufSize},
+			{Binding: 7, Buffer: r.foamLayerBuf, Size: foamLayerBufSize},
+			{Binding: 8, Buffer: r.opticalLayerBuf, Size: opticalLayerBufSize},
 		},
 	}); err != nil {
 		return
@@ -351,7 +438,7 @@ func NewRenderer(dev *wgpu.Device, format gputypes.TextureFormat) (r *Renderer, 
 		computeShader     *wgpu.ShaderModule
 	)
 
-	if renderShaderText, err = os.ReadFile("shaders/ocean_render_wows_v2.wgsl"); err != nil {
+	if renderShaderText, err = os.ReadFile("shaders/ocean_render.wgsl"); err != nil {
 		return nil, fmt.Errorf("read render shader: %w", err)
 	}
 	if skyShaderText, err = os.ReadFile("shaders/sky.wgsl"); err != nil {
@@ -403,10 +490,10 @@ func NewRenderer(dev *wgpu.Device, format gputypes.TextureFormat) (r *Renderer, 
 	if r.fftSlopeZColsPipeline, err = r.createComputePipeline(computeShader, "ocean fft slope z columns pipeline", "fft_slope_z_columns"); err != nil {
 		return
 	}
-	if r.fftDispXColsPipeline, err = r.createComputePipeline(computeShader, "ocean fft displacement x columns pipeline", "fft_disp_x_columns"); err != nil {
+	if r.fftDispXColsPipeline, err = r.createComputePipeline(computeShader, "ocean fft displacement x columns pipeline", "fft_displacement_x_columns"); err != nil {
 		return
 	}
-	if r.fftDispZColsPipeline, err = r.createComputePipeline(computeShader, "ocean fft displacement z columns pipeline", "fft_disp_z_columns"); err != nil {
+	if r.fftDispZColsPipeline, err = r.createComputePipeline(computeShader, "ocean fft displacement z columns pipeline", "fft_displacement_z_columns"); err != nil {
 		return
 	}
 	if r.finalizePipeline, err = r.createComputePipeline(computeShader, "ocean fft finalize pipeline", "finalize_samples"); err != nil {
@@ -473,12 +560,16 @@ func NewRenderer(dev *wgpu.Device, format gputypes.TextureFormat) (r *Renderer, 
 }
 
 func (r *Renderer) createComputePipeline(shader *wgpu.ShaderModule, label, entryPoint string) (*wgpu.ComputePipeline, error) {
-	return r.device.CreateComputePipeline(&wgpu.ComputePipelineDescriptor{
+	pipe, err := r.device.CreateComputePipeline(&wgpu.ComputePipelineDescriptor{
 		Label:      label,
 		Layout:     r.computePipeLayout,
 		Module:     shader,
 		EntryPoint: entryPoint,
 	})
+	if err != nil {
+		return nil, fmt.Errorf("%s entry %q: %w", label, entryPoint, err)
+	}
+	return pipe, nil
 }
 
 func (r *Renderer) Tuning() OceanTuning {
@@ -663,52 +754,18 @@ func (r *Renderer) packTuning(frame *FrameUniforms) {
 }
 
 func (r *Renderer) updateOceanOrigin(frame *FrameUniforms) {
-	const (
-		deadZoneMeters     float32 = 260.0
-		maxRecenteringRate float32 = 150.0
-	)
-
+	// Keep the projected sea grid continuously camera-relative, but sample all waves
+	// and material layers in absolute world coordinates. The previous 2m snapped
+	// origin removed some LOD crawling, but it created visible material/normal pops
+	// whenever the camera crossed a snap boundary. With the single projected grid,
+	// continuous origin is now the lower-flicker choice.
 	cameraX := frame.Data[16]
 	cameraZ := frame.Data[18]
-	now := frame.Data[23]
 
-	if !r.hasOceanOrigin {
-		r.oceanOriginX = cameraX
-		r.oceanOriginZ = cameraZ
-		r.lastOriginTime = now
-		r.hasOceanOrigin = true
-	}
-
-	dt := now - r.lastOriginTime
-	if dt < 0 || dt > 0.10 {
-		dt = 1.0 / 60.0
-	}
-	r.lastOriginTime = now
-
-	dx := cameraX - r.oceanOriginX
-	dz := cameraZ - r.oceanOriginZ
-	dist := float32(math.Sqrt(float64(dx*dx + dz*dz)))
-
-	if dist > deadZoneMeters {
-		invDist := float32(1.0) / dist
-		targetX := cameraX - dx*invDist*deadZoneMeters
-		targetZ := cameraZ - dz*invDist*deadZoneMeters
-
-		alpha := float32(1.0 - math.Exp(float64(-2.0*dt)))
-		maxStep := maxRecenteringRate * dt
-
-		stepX := (targetX - r.oceanOriginX) * alpha
-		stepZ := (targetZ - r.oceanOriginZ) * alpha
-		stepLen := float32(math.Sqrt(float64(stepX*stepX + stepZ*stepZ)))
-		if stepLen > maxStep && stepLen > 1e-5 {
-			s := maxStep / stepLen
-			stepX *= s
-			stepZ *= s
-		}
-
-		r.oceanOriginX += stepX
-		r.oceanOriginZ += stepZ
-	}
+	r.oceanOriginX = cameraX
+	r.oceanOriginZ = cameraZ
+	r.hasOceanOrigin = true
+	r.lastOriginTime = frame.Data[23]
 
 	frame.Data[54] = r.oceanOriginX
 	frame.Data[55] = r.oceanOriginZ
@@ -762,6 +819,9 @@ func (r *Renderer) Release() {
 		r.renderBindGroup,
 		r.computeBindLayout,
 		r.renderBindLayout,
+		r.opticalLayerBuf,
+		r.foamLayerBuf,
+		r.waveLayerBuf,
 		r.fieldMapBuf,
 		r.fftBBuf,
 		r.fftABuf,
