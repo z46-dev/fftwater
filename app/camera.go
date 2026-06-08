@@ -15,7 +15,7 @@ const (
 	waterCameraMaxPitch        float32 = 0.08
 	waterCameraDefaultFOV      float32 = 62.0 * math.Pi / 180.0
 	waterCameraDefaultNear     float32 = 0.25
-	waterCameraDefaultFar      float32 = 65000.0
+	waterCameraDefaultFar      float32 = 260000.0
 	waterCameraDefaultYaw      float32 = 0.0
 	waterCameraDefaultPitch    float32 = -0.24
 )

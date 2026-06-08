@@ -44,8 +44,12 @@ fn sanitize_field(v: vec4<f32>) -> vec4<f32> {
     );
 }
 
+fn wrap_index(v: i32, n: i32) -> i32 {
+    return ((v % n) + n) % n;
+}
+
 fn load_raw(coord: vec2<i32>, n: i32) -> vec4<f32> {
-    let c = clamp(coord, vec2<i32>(0, 0), vec2<i32>(n - 1, n - 1));
+    let c = vec2<i32>(wrap_index(coord.x, n), wrap_index(coord.y, n));
     return sanitize_field(textureLoad(spectrum_raw, c, 0));
 }
 
@@ -73,7 +77,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // field pass: future FFT stages can write raw displacement/foam, then this
     // pass remains as the finite-value and foam-stability boundary before
     // shading. It also suppresses isolated white texel/square foam spikes.
-    var filtered = (c * 9.5 + (l + r + d + u) * 1.15 + (dl + dr + ul + ur) * 0.35) / 15.5;
+    var filtered = (c * 11.0 + (l + r + d + u) * 0.95 + (dl + dr + ul + ur) * 0.20) / 15.6;
     filtered = sanitize_field(filtered);
 
     let axial_foam = (l.w + r.w + d.w + u.w) * 0.25;
@@ -83,9 +87,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // If one texel says "full foam" but its neighbors do not, treat it as a
     // data-path spike rather than a breaking wave. Real crest foam should have
     // spatial support across nearby cells.
-    var foam = min(filtered.w, local_support * 1.45 + 0.010);
-    foam = smoothstep(0.035, 0.820, foam);
-    filtered.w = clamp(foam, 0.0, 0.62);
+    var foam = min(filtered.w, local_support * 1.25 + 0.006);
+    foam = smoothstep(0.055, 0.760, foam);
+    filtered.w = clamp(foam, 0.0, 0.42);
 
     textureStore(spectrum_filtered, p, filtered);
 }

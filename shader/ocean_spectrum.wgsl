@@ -91,10 +91,10 @@ fn sanitize_tile(v: vec4<f32>) -> vec4<f32> {
 
 fn sanitize_wave(w: WaveContrib) -> WaveContrib {
     var r: WaveContrib;
-    r.height = finite_or(w.height, 0.0, 5.0);
-    r.disp = vec2<f32>(finite_or(w.disp.x, 0.0, 16.0), finite_or(w.disp.y, 0.0, 16.0));
-    r.slope = vec2<f32>(finite_or(w.slope.x, 0.0, 4.0), finite_or(w.slope.y, 0.0, 4.0));
-    r.curvature = finite_or(w.curvature, 0.0, 0.22);
+    r.height = finite_or(w.height, 0.0, 3.2);
+    r.disp = vec2<f32>(finite_or(w.disp.x, 0.0, 12.0), finite_or(w.disp.y, 0.0, 12.0));
+    r.slope = vec2<f32>(finite_or(w.slope.x, 0.0, 5.0), finite_or(w.slope.y, 0.0, 5.0));
+    r.curvature = finite_or(w.curvature, 0.0, 0.18);
     return r;
 }
 
@@ -120,28 +120,28 @@ fn cascade_params(index: i32) -> CascadeParams {
 
     if index == 0 {
         c.domain = 900.0;
-        c.height_gain = 0.42;
-        c.chop_gain = 1.95;
-        c.slope_scale = 1.10;
-        c.curvature_gain = 0.62;
+        c.height_gain = 0.24;
+        c.chop_gain = 1.35;
+        c.slope_scale = 1.30;
+        c.curvature_gain = 0.52;
     } else if index == 1 {
         c.domain = 360.0;
-        c.height_gain = 0.34;
-        c.chop_gain = 2.20;
-        c.slope_scale = 1.55;
-        c.curvature_gain = 0.88;
+        c.height_gain = 0.23;
+        c.chop_gain = 1.85;
+        c.slope_scale = 1.95;
+        c.curvature_gain = 0.78;
     } else if index == 2 {
         c.domain = 150.0;
-        c.height_gain = 0.20;
-        c.chop_gain = 1.80;
-        c.slope_scale = 2.05;
-        c.curvature_gain = 1.20;
+        c.height_gain = 0.13;
+        c.chop_gain = 1.45;
+        c.slope_scale = 2.75;
+        c.curvature_gain = 1.18;
     } else {
         c.domain = 62.0;
-        c.height_gain = 0.090;
-        c.chop_gain = 0.95;
-        c.slope_scale = 2.80;
-        c.curvature_gain = 1.65;
+        c.height_gain = 0.045;
+        c.chop_gain = 0.55;
+        c.slope_scale = 3.60;
+        c.curvature_gain = 1.75;
     }
 
     return c;
@@ -250,14 +250,14 @@ fn spectrum_large_mid(p: vec2<f32>) -> WaveContrib {
 fn large_mid_foam_energy(p: vec2<f32>, w: WaveContrib) -> f32 {
     let t = frame.resolution_time_grid.z;
     let slope_mag = length(w.slope);
-    let crest = smoothstep(0.0040, 0.0300, -w.curvature);
-    let breaking = smoothstep(0.060, 0.180, slope_mag) * crest;
+    let crest = smoothstep(0.0080, 0.0450, -w.curvature);
+    let breaking = smoothstep(0.110, 0.300, slope_mag) * crest;
 
     let wind_streak = noise2(p * vec2<f32>(0.030, 0.085) + vec2<f32>(t * 0.16, -t * 0.42));
     let lace = noise2(p * 0.240 + vec2<f32>(-t * 0.95, t * 0.51));
     let breakup = smoothstep(0.42, 0.82, wind_streak) * smoothstep(0.36, 0.74, lace);
 
-    return clamp(breaking * mix(0.12, 0.62, breakup), 0.0, 0.55);
+    return clamp(breaking * mix(0.045, 0.34, breakup), 0.0, 0.34);
 }
 
 @compute @workgroup_size(8, 8, 1)

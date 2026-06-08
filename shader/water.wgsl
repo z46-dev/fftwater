@@ -31,11 +31,24 @@ var<uniform> frame: FrameUniforms;
 @group(0) @binding(1)
 var spectrum_tex: texture_2d<f32>;
 
+// Final FFT tile outputs are bound directly for render-time cascade sampling.
+// The filtered field texture is useful for broad/far water and foam, but it is
+// too coarse to carry WoWS-style near-camera geometric chop. Sampling the FFT
+// cascade tiles directly preserves the short/crossing waves without reverting
+// to hand-authored Gerstner displacement.
+@group(0) @binding(2)
+var fft_primary_tiles: texture_2d<f32>;
+
+@group(0) @binding(3)
+var fft_aux_tiles: texture_2d<f32>;
+
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
     @location(1) base_xz: vec2<f32>,
     @location(2) view_distance: f32,
+    @location(3) foam_signal: f32,
+    @location(4) field_height: f32,
 };
 
 struct WaveContrib {
@@ -53,9 +66,9 @@ const G: f32 = 9.81;
 // guard coverage those displaced edge vertices expose the clear color at the
 // bottom and sides of the frame. The asymmetric bottom guard is intentional:
 // near-camera water occupies more vertical screen area than the far horizon.
-const GRID_GUARD_X: f32 = 1.35;
-const GRID_GUARD_TOP: f32 = 0.70;
-const GRID_GUARD_BOTTOM: f32 = 2.40;
+const GRID_GUARD_X: f32 = 1.80;
+const GRID_GUARD_TOP: f32 = 0.42;
+const GRID_GUARD_BOTTOM: f32 = 3.10;
 const MIN_RAY_PLANE_Y: f32 = 0.00003;
 
 fn empty_wave() -> WaveContrib {
@@ -107,10 +120,19 @@ fn spectrum_detail(p: vec2<f32>) -> WaveContrib {
     // The shortest components remain in the fragment shader for now: they are
     // visual detail normals/ripples, while large/mid water displacement now
     // comes from a GPU field texture generated before the render pass.
-    w = add_wave(w, wave_component(p + vec2<f32>(t * 3.4, -t * 1.6), vec2<f32>( 0.72, -0.69), 9.5, 0.052, 3.4, 0.34, 1.9));
-    w = add_wave(w, wave_component(p + vec2<f32>(-t * 2.1, t * 2.9), vec2<f32>(-0.18,  0.98), 6.6, 0.035, 4.2, 0.28, 3.7));
-    w = add_wave(w, wave_component(p + vec2<f32>(t * 4.6, t * 1.1), vec2<f32>(-0.94, -0.33), 4.1, 0.020, 5.3, 0.22, 5.4));
-    w = add_wave(w, wave_component(p + vec2<f32>(-t * 5.5, -t * 2.7), vec2<f32>( 0.37,  0.93), 2.7, 0.010, 7.0, 0.16, 0.6));
+    // Eight low-amplitude crossing detail trains.  This is intentionally a
+    // normal/foam-detail layer, not a return to Gerstner geometry.  The FFT
+    // field still owns large/mid displacement; these fast bands provide the
+    // WoWS-like restless surface texture that the low-resolution cascaded FFT
+    // cannot yet carry by itself.
+    w = add_wave(w, wave_component(p + vec2<f32>( t * 3.4, -t * 1.6), vec2<f32>( 0.72, -0.69), 12.5, 0.034, 3.0, 0.28, 1.9));
+    w = add_wave(w, wave_component(p + vec2<f32>(-t * 2.1,  t * 2.9), vec2<f32>(-0.18,  0.98),  8.4, 0.030, 3.8, 0.25, 3.7));
+    w = add_wave(w, wave_component(p + vec2<f32>( t * 4.6,  t * 1.1), vec2<f32>(-0.94, -0.33),  6.1, 0.022, 4.8, 0.21, 5.4));
+    w = add_wave(w, wave_component(p + vec2<f32>(-t * 5.5, -t * 2.7), vec2<f32>( 0.37,  0.93),  4.2, 0.016, 5.8, 0.18, 0.6));
+    w = add_wave(w, wave_component(p + vec2<f32>( t * 6.2, -t * 3.8), vec2<f32>( 0.91,  0.41),  3.1, 0.010, 7.2, 0.14, 2.8));
+    w = add_wave(w, wave_component(p + vec2<f32>(-t * 7.4,  t * 1.7), vec2<f32>(-0.68,  0.73),  2.4, 0.007, 8.6, 0.11, 4.9));
+    w = add_wave(w, wave_component(p + vec2<f32>( t * 8.6,  t * 4.1), vec2<f32>( 0.12, -0.99),  1.9, 0.004, 9.5, 0.08, 0.2));
+    w = add_wave(w, wave_component(p + vec2<f32>(-t * 9.1, -t * 5.6), vec2<f32>(-0.99, -0.08),  1.45, 0.0025, 10.5, 0.06, 5.8));
     return w;
 }
 
@@ -177,6 +199,236 @@ fn sample_spectrum_field(base_xz: vec2<f32>) -> vec4<f32> {
     return sanitize_spectrum_field(mix(mix(a, b, f.x), mix(c, d, f.x), f.y));
 }
 
+
+struct DirectCascadeParams {
+    domain: f32,
+    height_gain: f32,
+    chop_gain: f32,
+    slope_scale: f32,
+    curvature_gain: f32,
+};
+
+fn direct_cascade_params(index: i32) -> DirectCascadeParams {
+    var c: DirectCascadeParams;
+
+    if index == 0 {
+        c.domain = 900.0;
+        c.height_gain = 0.145;
+        c.chop_gain = 1.00;
+        c.slope_scale = 1.05;
+        c.curvature_gain = 0.40;
+    } else if index == 1 {
+        c.domain = 360.0;
+        c.height_gain = 0.140;
+        c.chop_gain = 1.38;
+        c.slope_scale = 1.55;
+        c.curvature_gain = 0.64;
+    } else if index == 2 {
+        c.domain = 150.0;
+        c.height_gain = 0.090;
+        c.chop_gain = 1.05;
+        c.slope_scale = 2.30;
+        c.curvature_gain = 1.08;
+    } else {
+        c.domain = 62.0;
+        c.height_gain = 0.040;
+        c.chop_gain = 0.42;
+        c.slope_scale = 3.05;
+        c.curvature_gain = 1.72;
+    }
+
+    return c;
+}
+
+fn sanitize_direct_tile(v: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(
+        finite_or(v.x, 0.0, 96.0),
+        finite_or(v.y, 0.0, 96.0),
+        finite_or(v.z, 0.0, 96.0),
+        finite_or(v.w, 0.0, 96.0)
+    );
+}
+
+fn direct_load_primary(coord: vec2<i32>, cascade_index: i32, mode_dim: i32, total_h: i32) -> vec4<f32> {
+    let x = ((coord.x % mode_dim) + mode_dim) % mode_dim;
+    let y_local = ((coord.y % mode_dim) + mode_dim) % mode_dim;
+    let y = cascade_index * mode_dim + y_local;
+    if y < 0 || y >= total_h {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    return sanitize_direct_tile(textureLoad(fft_primary_tiles, vec2<i32>(x, y), 0));
+}
+
+fn direct_load_aux(coord: vec2<i32>, cascade_index: i32, mode_dim: i32, total_h: i32) -> vec4<f32> {
+    let x = ((coord.x % mode_dim) + mode_dim) % mode_dim;
+    let y_local = ((coord.y % mode_dim) + mode_dim) % mode_dim;
+    let y = cascade_index * mode_dim + y_local;
+    if y < 0 || y >= total_h {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    return sanitize_direct_tile(textureLoad(fft_aux_tiles, vec2<i32>(x, y), 0));
+}
+
+fn direct_bilerp4(a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32>, f: vec2<f32>) -> vec4<f32> {
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+fn direct_sample_primary(p: vec2<f32>, cascade_index: i32, mode_dim: i32, total_h: i32) -> vec4<f32> {
+    let c = direct_cascade_params(cascade_index);
+    let coord = fract(p / c.domain) * f32(mode_dim);
+    let i0 = vec2<i32>(floor(coord));
+    let f = fract(coord);
+
+    let a = direct_load_primary(i0 + vec2<i32>(0, 0), cascade_index, mode_dim, total_h);
+    let b = direct_load_primary(i0 + vec2<i32>(1, 0), cascade_index, mode_dim, total_h);
+    let c0 = direct_load_primary(i0 + vec2<i32>(0, 1), cascade_index, mode_dim, total_h);
+    let d = direct_load_primary(i0 + vec2<i32>(1, 1), cascade_index, mode_dim, total_h);
+    return sanitize_direct_tile(direct_bilerp4(a, b, c0, d, f));
+}
+
+fn direct_sample_aux(p: vec2<f32>, cascade_index: i32, mode_dim: i32, total_h: i32) -> vec4<f32> {
+    let c = direct_cascade_params(cascade_index);
+    let coord = fract(p / c.domain) * f32(mode_dim);
+    let i0 = vec2<i32>(floor(coord));
+    let f = fract(coord);
+
+    let a = direct_load_aux(i0 + vec2<i32>(0, 0), cascade_index, mode_dim, total_h);
+    let b = direct_load_aux(i0 + vec2<i32>(1, 0), cascade_index, mode_dim, total_h);
+    let c0 = direct_load_aux(i0 + vec2<i32>(0, 1), cascade_index, mode_dim, total_h);
+    let d = direct_load_aux(i0 + vec2<i32>(1, 1), cascade_index, mode_dim, total_h);
+    return sanitize_direct_tile(direct_bilerp4(a, b, c0, d, f));
+}
+
+fn direct_sample_primary_nearest(p: vec2<f32>, cascade_index: i32, mode_dim: i32, total_h: i32) -> vec4<f32> {
+    let c = direct_cascade_params(cascade_index);
+    let coord = fract(p / c.domain) * f32(mode_dim);
+    return direct_load_primary(vec2<i32>(floor(coord)), cascade_index, mode_dim, total_h);
+}
+
+fn direct_sample_aux_nearest(p: vec2<f32>, cascade_index: i32, mode_dim: i32, total_h: i32) -> vec4<f32> {
+    let c = direct_cascade_params(cascade_index);
+    let coord = fract(p / c.domain) * f32(mode_dim);
+    return direct_load_aux(vec2<i32>(floor(coord)), cascade_index, mode_dim, total_h);
+}
+
+fn direct_cascade_geometry_fast(p: vec2<f32>, cascade_index: i32, mode_dim: i32, total_h: i32) -> WaveContrib {
+    let c = direct_cascade_params(cascade_index);
+    let primary = direct_sample_primary_nearest(p, cascade_index, mode_dim, total_h);
+    let aux = direct_sample_aux_nearest(p, cascade_index, mode_dim, total_h);
+
+    var w: WaveContrib;
+    w.height = primary.x * c.height_gain;
+    w.disp = vec2<f32>(primary.z, aux.x) * c.chop_gain * frame.water_params0.y;
+    w.slope = vec2<f32>(0.0, 0.0);
+    w.curvature = aux.z * c.curvature_gain;
+    return sanitize_direct_wave(w);
+}
+
+fn weighted_add_wave(a: WaveContrib, b: WaveContrib, weight: f32) -> WaveContrib {
+    var r: WaveContrib;
+    r.height = a.height + b.height * weight;
+    r.disp = a.disp + b.disp * weight;
+    r.slope = a.slope + b.slope * weight;
+    r.curvature = a.curvature + b.curvature * weight;
+    return r;
+}
+
+fn direct_fft_geometry_lod(p: vec2<f32>, view_distance: f32) -> WaveContrib {
+    let dims = textureDimensions(fft_primary_tiles, 0);
+    let mode_dim = i32(dims.x);
+    let total_h = i32(dims.y);
+
+    var w = empty_wave();
+
+    // WoWS-style density comes from several crossing cascades, but evaluating
+    // all cascades with bilinear lookup per vertex and again per fragment was
+    // the main reason patch 0016 collapsed to ~20 FPS on integrated GPUs.  This
+    // render-time path is now explicitly LODed: large cascades survive farther,
+    // short/micro cascades are near-field only, and each cascade uses one native
+    // FFT tile load per packed field.  The filtered field texture still covers
+    // broad/far water, while the direct tiles add visible near geometry.
+    let w0 = 1.0 - smoothstep(3200.0, 6200.0, view_distance);
+    let w1 = 1.0 - smoothstep(1700.0, 3600.0, view_distance);
+    let w2 = 1.0 - smoothstep(520.0, 1500.0, view_distance);
+    let w3 = 1.0 - smoothstep(120.0, 430.0, view_distance);
+
+    if w0 > 0.001 {
+        w = weighted_add_wave(w, direct_cascade_geometry_fast(p, 0, mode_dim, total_h), w0);
+    }
+    if w1 > 0.001 {
+        w = weighted_add_wave(w, direct_cascade_geometry_fast(p, 1, mode_dim, total_h), w1);
+    }
+    if w2 > 0.001 {
+        w = weighted_add_wave(w, direct_cascade_geometry_fast(p, 2, mode_dim, total_h), w2);
+    }
+    if w3 > 0.001 {
+        w = weighted_add_wave(w, direct_cascade_geometry_fast(p, 3, mode_dim, total_h), w3);
+    }
+
+    return sanitize_direct_wave(w);
+}
+
+fn sanitize_direct_wave(w: WaveContrib) -> WaveContrib {
+    var r: WaveContrib;
+    r.height = finite_or(w.height, 0.0, 2.4);
+    r.disp = vec2<f32>(finite_or(w.disp.x, 0.0, 8.0), finite_or(w.disp.y, 0.0, 8.0));
+    r.slope = vec2<f32>(finite_or(w.slope.x, 0.0, 4.0), finite_or(w.slope.y, 0.0, 4.0));
+    r.curvature = finite_or(w.curvature, 0.0, 0.26);
+    return r;
+}
+
+fn direct_cascade_geometry(p: vec2<f32>, cascade_index: i32, mode_dim: i32, total_h: i32) -> WaveContrib {
+    let c = direct_cascade_params(cascade_index);
+    let primary = direct_sample_primary(p, cascade_index, mode_dim, total_h);
+    let aux = direct_sample_aux(p, cascade_index, mode_dim, total_h);
+
+    var w: WaveContrib;
+    w.height = primary.x * c.height_gain;
+    w.disp = vec2<f32>(primary.z, aux.x) * c.chop_gain * frame.water_params0.y;
+    w.slope = vec2<f32>(0.0, 0.0);
+    w.curvature = aux.z * c.curvature_gain;
+    return sanitize_direct_wave(w);
+}
+
+fn direct_cascade_wave(p: vec2<f32>, cascade_index: i32, mode_dim: i32, total_h: i32) -> WaveContrib {
+    let c = direct_cascade_params(cascade_index);
+    let dx = max(c.domain / f32(mode_dim), 0.22);
+    var w = direct_cascade_geometry(p, cascade_index, mode_dim, total_h);
+
+    let h_l = direct_cascade_geometry(p - vec2<f32>(dx, 0.0), cascade_index, mode_dim, total_h).height;
+    let h_r = direct_cascade_geometry(p + vec2<f32>(dx, 0.0), cascade_index, mode_dim, total_h).height;
+    let h_d = direct_cascade_geometry(p - vec2<f32>(0.0, dx), cascade_index, mode_dim, total_h).height;
+    let h_u = direct_cascade_geometry(p + vec2<f32>(0.0, dx), cascade_index, mode_dim, total_h).height;
+    w.slope = vec2<f32>((h_r - h_l) / (2.0 * dx), (h_u - h_d) / (2.0 * dx)) * c.slope_scale;
+    return sanitize_direct_wave(w);
+}
+
+fn direct_fft_geometry(p: vec2<f32>) -> WaveContrib {
+    let dims = textureDimensions(fft_primary_tiles, 0);
+    let mode_dim = i32(dims.x);
+    let total_h = i32(dims.y);
+
+    var w = empty_wave();
+    w = add_wave(w, direct_cascade_geometry(p, 0, mode_dim, total_h));
+    w = add_wave(w, direct_cascade_geometry(p, 1, mode_dim, total_h));
+    w = add_wave(w, direct_cascade_geometry(p, 2, mode_dim, total_h));
+    w = add_wave(w, direct_cascade_geometry(p, 3, mode_dim, total_h));
+    return sanitize_direct_wave(w);
+}
+
+fn direct_fft_wave(p: vec2<f32>) -> WaveContrib {
+    let dims = textureDimensions(fft_primary_tiles, 0);
+    let mode_dim = i32(dims.x);
+    let total_h = i32(dims.y);
+
+    var w = empty_wave();
+    w = add_wave(w, direct_cascade_wave(p, 0, mode_dim, total_h));
+    w = add_wave(w, direct_cascade_wave(p, 1, mode_dim, total_h));
+    w = add_wave(w, direct_cascade_wave(p, 2, mode_dim, total_h));
+    w = add_wave(w, direct_cascade_wave(p, 3, mode_dim, total_h));
+    return sanitize_direct_wave(w);
+}
+
 fn projected_grid_uv(vertex_index: u32) -> vec2<f32> {
     let n = max(u32(frame.resolution_time_grid.w), 2u);
     let cell_vertex = vertex_index % 6u;
@@ -205,6 +457,22 @@ fn projected_grid_edge_fade(uv: vec2<f32>) -> f32 {
     // revealing the clear color when the camera is close to the ocean.
     let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
     return smoothstep(0.035, 0.115, edge);
+}
+
+fn projected_grid_boundary_pin(uv: vec2<f32>) -> f32 {
+    // Projected-grid displacement is correct in the interior, but the outer
+    // guard vertices must behave like a skirt.  If they are allowed to project
+    // only from their displaced world positions, near-camera zoom and horizontal
+    // chop can pull the boundary inward and reveal the clear color.  Pinning
+    // only the side and bottom guard bands to their generated NDC coordinates
+    // preserves the infinite-water coverage while avoiding a top skirt that
+    // would draw water into the sky above the horizon.
+    let side_dist = min(uv.x, 1.0 - uv.x);
+    let bottom_dist = 1.0 - uv.y;
+    let side_gate = smoothstep(0.10, 0.28, uv.y);
+    let side_pin = (1.0 - smoothstep(0.018, 0.120, side_dist)) * side_gate;
+    let bottom_pin = 1.0 - smoothstep(0.016, 0.150, bottom_dist);
+    return clamp(max(side_pin, bottom_pin), 0.0, 1.0);
 }
 
 fn projected_grid_ndc(uv: vec2<f32>) -> vec2<f32> {
@@ -247,7 +515,7 @@ fn intersect_water_plane(ndc: vec2<f32>) -> vec2<f32> {
     if abs(dir.y) > MIN_RAY_PLANE_Y {
         let plane_t = (water_y - cam.y) / dir.y;
         if plane_t > 0.0 {
-            t = min(plane_t, max_dist * 4.0);
+            t = min(plane_t, max_dist);
         }
     }
 
@@ -270,55 +538,78 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
     let edge_fade = projected_grid_edge_fade(uv);
 
     let water_y = frame.camera_forward_water.w;
+    let base_world = vec3<f32>(base_xz.x, water_y, base_xz.y);
+    let base_view_distance = length(base_world - frame.camera_pos_fov.xyz);
+    let direct = direct_fft_geometry_lod(base_xz, base_view_distance);
+
+    // Direct FFT tile sampling is a near/mid geometry enhancement now. The
+    // filtered field remains the stable broad-ocean base, so we can keep the
+    // vertex count reasonable without making the surface read flat.
+    let direct_weight = 1.0 - smoothstep(1450.0, 4200.0, base_view_distance);
+    let geom_disp = mix(field.xz, direct.disp, direct_weight);
+    let geom_h = mix(field.y, direct.height, direct_weight);
+
     let world = vec3<f32>(
-        base_xz.x + field.x * edge_fade,
-        water_y + field.y * edge_fade,
-        base_xz.y + field.z * edge_fade
+        base_xz.x + geom_disp.x * edge_fade,
+        water_y + geom_h * edge_fade,
+        base_xz.y + geom_disp.y * edge_fade
     );
 
     var out: VertexOut;
-    out.position = frame.view_proj * vec4<f32>(world, 1.0);
+    let real_clip = frame.view_proj * vec4<f32>(world, 1.0);
+    let boundary_pin = projected_grid_boundary_pin(uv);
+    let pinned_z = clamp(real_clip.z, real_clip.w * 0.0001, real_clip.w * 0.9999);
+    let pinned_clip = vec4<f32>(ndc.x * real_clip.w, ndc.y * real_clip.w, pinned_z, real_clip.w);
+    out.position = vec4<f32>(mix(real_clip.xy, pinned_clip.xy, boundary_pin), mix(real_clip.z, pinned_clip.z, boundary_pin), real_clip.w);
     out.world_pos = world;
     out.base_xz = base_xz;
     out.view_distance = length(world - frame.camera_pos_fov.xyz);
+    out.foam_signal = clamp(field.w * 0.32 + smoothstep(0.020, 0.150, -direct.curvature) * direct_weight * 0.34 + smoothstep(0.15, 2.20, length(direct.disp)) * direct_weight * 0.12, 0.0, 1.0);
+    out.field_height = field.y;
     return out;
 }
 
-fn ocean_normal(base_xz: vec2<f32>) -> vec3<f32> {
-    // Reconstruct the large/mid normal from the spectrum height texture instead
-    // of re-evaluating waves analytically. This is the meaningful data-path
-    // step: subsequent FFT passes can write the same field contract.
-    let dx = spectrum_texel_size();
-    let h_l = sample_spectrum_field(base_xz - vec2<f32>(dx, 0.0)).y;
-    let h_r = sample_spectrum_field(base_xz + vec2<f32>(dx, 0.0)).y;
-    let h_d = sample_spectrum_field(base_xz - vec2<f32>(0.0, dx)).y;
-    let h_u = sample_spectrum_field(base_xz + vec2<f32>(0.0, dx)).y;
-    let large_mid_slope = vec2<f32>((h_r - h_l) / (2.0 * dx), (h_u - h_d) / (2.0 * dx));
+fn geometric_normal(world_pos: vec3<f32>) -> vec3<f32> {
+    var n = normalize(cross(dpdy(world_pos), dpdx(world_pos)));
+    if n.y < 0.0 {
+        n = -n;
+    }
+    return n;
+}
 
-    let detail = spectrum_detail(base_xz * 1.18);
+fn ocean_normal(world_pos: vec3<f32>, base_xz: vec2<f32>) -> vec3<f32> {
+    // Use screen-space derivatives of the displaced projected grid for the main
+    // water normal. This preserves FFT-backed geometry in the material without
+    // doing an expensive cascade-tile finite difference for every pixel.
+    let geom = geometric_normal(world_pos);
+    let geom_slope = vec2<f32>(-geom.x, -geom.z) / max(geom.y, 0.18);
+
+    let detail = spectrum_detail(base_xz * 1.05);
     let counter_detail = spectrum_detail(base_xz * vec2<f32>(-0.73, 0.91) + vec2<f32>(37.0, -19.0));
-    let slope = large_mid_slope + (detail.slope * 0.72 + counter_detail.slope * 0.34) * frame.water_params0.w;
+    let cross_detail = spectrum_detail(base_xz * vec2<f32>(0.46, -1.22) + vec2<f32>(-83.0, 41.0));
+    let detail_slope = (detail.slope * 0.50 + counter_detail.slope * 0.34 + cross_detail.slope * 0.24) * frame.water_params0.w;
+    let slope = geom_slope + detail_slope;
     return normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
 }
 
-fn crest_foam(base_xz: vec2<f32>, view_distance: f32) -> f32 {
-    let field = sample_spectrum_field(base_xz);
-    let detail = spectrum_detail(base_xz * 1.18);
+fn crest_foam(base_xz: vec2<f32>, view_distance: f32, foam_signal: f32) -> f32 {
+    let detail = spectrum_detail(base_xz * 1.05);
     let counter_detail = spectrum_detail(base_xz * vec2<f32>(-0.73, 0.91) + vec2<f32>(37.0, -19.0));
-    let detail_breaking = smoothstep(0.20, 0.52, length(detail.slope + counter_detail.slope * 0.42)) * smoothstep(0.010, 0.036, -(detail.curvature + counter_detail.curvature * 0.28));
+    let cross_detail = spectrum_detail(base_xz * vec2<f32>(0.46, -1.22) + vec2<f32>(-83.0, 41.0));
+    let detail_breaking = smoothstep(0.28, 0.70, length(detail.slope + counter_detail.slope * 0.42 + cross_detail.slope * 0.25)) * smoothstep(0.018, 0.055, -(detail.curvature + counter_detail.curvature * 0.28 + cross_detail.curvature * 0.18));
 
     let t = frame.resolution_time_grid.z;
     let lace = noise2(base_xz * 0.420 + vec2<f32>(-t * 1.10, t * 0.52));
     let breakup = mix(0.55, 1.0, smoothstep(0.30, 0.82, lace));
     let distance_fade = 1.0 - smoothstep(850.0, 1700.0, view_distance);
 
-    return clamp((field.w * 0.62 + detail_breaking * 0.24) * breakup * distance_fade * frame.water_params0.z, 0.0, 0.72);
+    return clamp((foam_signal * 0.34 + detail_breaking * 0.13) * breakup * distance_fade * frame.water_params0.z, 0.0, 0.28);
 }
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let cam = frame.camera_pos_fov.xyz;
-    let n = ocean_normal(in.base_xz);
+    let n = ocean_normal(in.world_pos, in.base_xz);
     let view = normalize(cam - in.world_pos);
     let light = normalize(vec3<f32>(-0.42, 0.78, -0.46));
     let half_vec = normalize(light + view);
@@ -328,17 +619,12 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let n_dot_h = clamp(dot(n, half_vec), 0.0, 1.0);
     let fresnel = 0.020 + 0.980 * pow(1.0 - n_dot_v, 5.0);
 
-    let field = sample_spectrum_field(in.base_xz);
-    let detail = spectrum_detail(in.base_xz * 1.18);
+    let detail = spectrum_detail(in.base_xz * 1.05);
     let counter_detail = spectrum_detail(in.base_xz * vec2<f32>(-0.73, 0.91) + vec2<f32>(37.0, -19.0));
-    let dx = spectrum_texel_size();
-    let h_l = sample_spectrum_field(in.base_xz - vec2<f32>(dx, 0.0)).y;
-    let h_r = sample_spectrum_field(in.base_xz + vec2<f32>(dx, 0.0)).y;
-    let h_d = sample_spectrum_field(in.base_xz - vec2<f32>(0.0, dx)).y;
-    let h_u = sample_spectrum_field(in.base_xz + vec2<f32>(0.0, dx)).y;
-    let large_mid_slope = vec2<f32>((h_r - h_l) / (2.0 * dx), (h_u - h_d) / (2.0 * dx));
-    let slope_mag = length(large_mid_slope + detail.slope * 0.58 + counter_detail.slope * 0.26);
-    let foam = crest_foam(in.base_xz, in.view_distance);
+    let cross_detail = spectrum_detail(in.base_xz * vec2<f32>(0.46, -1.22) + vec2<f32>(-83.0, 41.0));
+    let geom_slope_mag = length(vec2<f32>(-n.x, -n.z) / max(n.y, 0.18));
+    let slope_mag = length(detail.slope * 0.38 + counter_detail.slope * 0.28 + cross_detail.slope * 0.22) + geom_slope_mag;
+    let foam = crest_foam(in.base_xz, in.view_distance, in.foam_signal);
 
     let deep = vec3<f32>(0.004, 0.045, 0.075);
     let body = vec3<f32>(0.010, 0.125, 0.165);
@@ -347,7 +633,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let zenith_sky = vec3<f32>(0.25, 0.43, 0.58);
 
     let distance_t = smoothstep(45.0, 820.0, in.view_distance);
-    let height_t = clamp(field.y * 0.12 + 0.52, 0.0, 1.0);
+    let height_t = clamp(in.field_height * 0.12 + 0.52, 0.0, 1.0);
     var volume = mix(body, deep, distance_t * 0.68);
     volume = mix(volume, lit_body, height_t * 0.38 * n_dot_l);
 
@@ -355,16 +641,16 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let sky_t = clamp(refl_dir.y * 0.52 + 0.38, 0.0, 1.0);
     let sky = mix(horizon_sky, zenith_sky, sky_t);
 
-    let roughness = clamp(0.052 + slope_mag * 0.19 + foam * 0.30, 0.052, 0.48);
+    let roughness = clamp(0.070 + slope_mag * 0.22 + foam * 0.34, 0.070, 0.56);
     let spec_power = mix(220.0, 32.0, roughness);
     let wind_grain = noise2(in.base_xz * vec2<f32>(0.072, 0.34) + vec2<f32>(frame.resolution_time_grid.z * 0.22, -frame.resolution_time_grid.z * 1.05));
-    let sparkle_mask = smoothstep(0.63, 0.94, wind_grain);
-    let specular = pow(n_dot_h, spec_power) * (0.18 + sparkle_mask * 0.24) * n_dot_l * (1.0 - foam * 0.82);
+    let sparkle_mask = smoothstep(0.70, 0.965, wind_grain);
+    let specular = pow(n_dot_h, spec_power) * (0.11 + sparkle_mask * 0.18) * n_dot_l * (1.0 - foam * 0.86);
 
     var color = mix(volume, sky, fresnel * 0.78);
     color += specular * vec3<f32>(1.0, 0.94, 0.82);
 
-    let foam_color = vec3<f32>(0.82, 0.90, 0.88);
+    let foam_color = vec3<f32>(0.78, 0.86, 0.84);
     color = mix(color, foam_color, foam);
 
     let aerial = smoothstep(620.0, 1800.0, in.view_distance);

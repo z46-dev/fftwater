@@ -11,17 +11,17 @@ import (
 )
 
 const (
-	waterGridCells           uint32  = 320
-	waterSpectrumTextureSize uint32  = 512
+	waterGridCells           uint32  = 256
+	waterSpectrumTextureSize uint32  = 384
 	waterModeTextureSize     uint32  = 64
 	waterModeCascadeCount    uint32  = 4
 	waterFFTStageCount               = 6
 	waterFrameUniformSize    uint64  = 176
-	waterMaxDistance         float32 = 42000.0
-	waterGridSnap            float32 = 0.5
-	waterChopScale           float32 = 0.86
-	waterFoamGain            float32 = 0.72
-	waterDetailGain          float32 = 1.48
+	waterMaxDistance         float32 = 120000.0
+	waterGridSnap            float32 = 0.40
+	waterChopScale           float32 = 0.72
+	waterFoamGain            float32 = 0.52
+	waterDetailGain          float32 = 1.52
 	waterSpectrumWorldSize   float32 = 4096.0
 )
 
@@ -383,6 +383,8 @@ func (r *WaterRenderer) createResources() error {
 		Entries: []wgpu.BindGroupLayoutEntry{
 			uniformLayoutEntry(wgpu.ShaderStageVertex | wgpu.ShaderStageFragment),
 			sampledFloatTextureLayoutEntry(1, wgpu.ShaderStageVertex|wgpu.ShaderStageFragment),
+			sampledFloatTextureLayoutEntry(2, wgpu.ShaderStageVertex|wgpu.ShaderStageFragment),
+			sampledFloatTextureLayoutEntry(3, wgpu.ShaderStageVertex|wgpu.ShaderStageFragment),
 		},
 	})
 	if err != nil {
@@ -587,6 +589,8 @@ func (r *WaterRenderer) createResources() error {
 		Entries: []wgpu.BindGroupEntry{
 			{Binding: 0, Buffer: r.uniformBuffer, Size: waterFrameUniformSize},
 			{Binding: 1, TextureView: r.fieldSpectrumView},
+			{Binding: 2, TextureView: r.fftPongView},
+			{Binding: 3, TextureView: r.fftAuxPongView},
 		},
 	})
 	if err != nil {

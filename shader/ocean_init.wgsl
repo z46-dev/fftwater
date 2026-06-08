@@ -77,41 +77,41 @@ fn cascade_params(index: i32) -> CascadeParams {
         // visible broad motion, not huge single ridges.
         c.domain = 900.0;
         c.wind_speed = 28.0;
-        c.amplitude = 0.000000038;
+        c.amplitude = 0.000000026;
         c.damping = 0.00100;
         c.spread_back = 0.22;
-        c.max_h0 = 0.22;
-        c.chop = 1.12;
+        c.max_h0 = 0.155;
+        c.chop = 0.92;
     } else if index == 1 {
         // Cross chop / mid waves. This band is intentionally close in energy to
         // the swell so the surface has interference instead of one dominant set.
         c.domain = 360.0;
         c.wind_speed = 24.0;
-        c.amplitude = 0.000000052;
+        c.amplitude = 0.000000040;
         c.damping = 0.00190;
         c.spread_back = 0.36;
-        c.max_h0 = 0.18;
-        c.chop = 1.12;
+        c.max_h0 = 0.135;
+        c.chop = 0.92;
     } else if index == 2 {
         // Short wind waves. These should contribute slope and choppy texture
         // more than bulk vertical displacement.
         c.domain = 150.0;
         c.wind_speed = 18.0;
-        c.amplitude = 0.000000058;
+        c.amplitude = 0.000000072;
         c.damping = 0.00450;
         c.spread_back = 0.52;
-        c.max_h0 = 0.13;
-        c.chop = 0.88;
+        c.max_h0 = 0.120;
+        c.chop = 0.78;
     } else {
         // Micro cascade. Kept physically in the spectral data path instead of
         // faking all high-frequency life in the fragment shader.
         c.domain = 62.0;
         c.wind_speed = 14.0;
-        c.amplitude = 0.000000044;
+        c.amplitude = 0.000000070;
         c.damping = 0.00950;
         c.spread_back = 0.70;
-        c.max_h0 = 0.075;
-        c.chop = 0.54;
+        c.max_h0 = 0.068;
+        c.chop = 0.46;
     }
 
     return c;
@@ -163,6 +163,35 @@ fn directional_lobe(k_hat: vec2<f32>, wind: vec2<f32>, spread_back: f32) -> f32 
     return forward * forward + backward * backward;
 }
 
+
+fn spectral_band_shape(k_len: f32, cascade_index: i32) -> f32 {
+    let params = cascade_params(cascade_index);
+    let mode_radius = k_len * params.domain / TAU;
+
+    // A plain Phillips spectrum puts too much visual authority into the first
+    // few low-frequency bins.  WoWS-style water has strong crossing mid/short
+    // wave trains, so bias each cascade toward a band of modes instead of just
+    // making the ocean taller.  This keeps bulk height controlled while making
+    // the geometry visibly restless.
+    let remove_single_swell = smoothstep(1.25, 3.75, mode_radius);
+
+    if cascade_index == 0 {
+        let swell_band = smoothstep(2.0, 5.5, mode_radius) * (1.0 - smoothstep(14.0, 24.0, mode_radius));
+        return mix(0.20, 0.76, remove_single_swell) * (0.70 + 0.30 * swell_band);
+    }
+    if cascade_index == 1 {
+        let cross_band = smoothstep(3.0, 8.0, mode_radius) * (1.0 - smoothstep(26.0, 42.0, mode_radius));
+        return mix(0.28, 0.92, remove_single_swell) * (0.76 + 0.44 * cross_band);
+    }
+    if cascade_index == 2 {
+        let chop_band = smoothstep(5.0, 12.0, mode_radius) * (1.0 - smoothstep(34.0, 55.0, mode_radius));
+        return mix(0.42, 1.00, remove_single_swell) * (0.82 + 0.62 * chop_band);
+    }
+
+    let micro_band = smoothstep(6.0, 15.0, mode_radius) * (1.0 - smoothstep(38.0, 62.0, mode_radius));
+    return mix(0.55, 1.00, remove_single_swell) * (0.86 + 0.72 * micro_band);
+}
+
 fn phillips_energy(k_vec: vec2<f32>, cascade_index: i32) -> f32 {
     let params = cascade_params(cascade_index);
     let k_len = max(length(k_vec), MIN_K);
@@ -177,13 +206,15 @@ fn phillips_energy(k_vec: vec2<f32>, cascade_index: i32) -> f32 {
     let primary = directional_lobe(k_hat, wind_dir_for_cascade(cascade_index), params.spread_back);
     let cross = directional_lobe(k_hat, cross_wind_dir_for_cascade(cascade_index), min(params.spread_back + 0.22, 0.85));
     let counter = directional_lobe(k_hat, counter_wind_dir_for_cascade(cascade_index), min(params.spread_back + 0.34, 0.95));
-    let directional = max(0.050, primary * 0.43 + cross * 0.34 + counter * 0.23);
+    let isotropic = 0.5 + 0.5 * abs(k_hat.x * k_hat.y);
+    let directional = max(0.045, primary * 0.31 + cross * 0.30 + counter * 0.27 + isotropic * 0.12);
 
     let largest_wave = params.wind_speed * params.wind_speed / G;
     let low_cut = exp(-1.0 / max(k2 * largest_wave * largest_wave, 0.000001));
     let high_cut = exp(-k2 * params.damping * params.damping);
 
-    let p = params.amplitude * low_cut * high_cut * directional / max(k4, 0.000000001);
+    let band_shape = spectral_band_shape(k_len, cascade_index);
+    let p = params.amplitude * low_cut * high_cut * directional * band_shape / max(k4, 0.000000001);
     return max(finite_or(p, 0.0, 1000.0), 0.0);
 }
 
