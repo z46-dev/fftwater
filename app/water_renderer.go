@@ -11,17 +11,17 @@ import (
 )
 
 const (
-	waterGridCells           uint32  = 352
-	waterSpectrumTextureSize uint32  = 384
+	waterGridCells           uint32  = 448
+	waterSpectrumTextureSize uint32  = 512
 	waterModeTextureSize     uint32  = 64
 	waterModeCascadeCount    uint32  = 4
 	waterFFTStageCount               = 6
 	waterFrameUniformSize    uint64  = 192
 	waterMaxDistance         float32 = 120000.0
-	waterGridSnap            float32 = 0.014
-	waterChopScale           float32 = 1.12
+	waterGridSnap            float32 = 0.001
+	waterChopScale           float32 = 0.96
 	waterFoamGain            float32 = 0.52
-	waterDetailGain          float32 = 1.72
+	waterDetailGain          float32 = 1.58
 	waterSpectrumWorldSize   float32 = 3072.0
 )
 

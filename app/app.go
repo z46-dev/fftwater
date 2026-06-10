@@ -115,7 +115,7 @@ func Run(log *golog.Logger) error {
 				return
 			}
 
-			look.Add(-float32(ev.DeltaX), -float32(ev.DeltaY))
+			look.Add(-float32(ev.DeltaX), float32(ev.DeltaY))
 		})
 	}
 
