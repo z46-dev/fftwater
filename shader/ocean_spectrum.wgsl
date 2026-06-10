@@ -120,28 +120,28 @@ fn cascade_params(index: i32) -> CascadeParams {
 
     if index == 0 {
         c.domain = 900.0;
-        c.height_gain = 0.24;
-        c.chop_gain = 1.35;
-        c.slope_scale = 1.30;
-        c.curvature_gain = 0.52;
+        c.height_gain = 0.062;
+        c.chop_gain = 0.92;
+        c.slope_scale = 1.20;
+        c.curvature_gain = 0.34;
     } else if index == 1 {
         c.domain = 360.0;
-        c.height_gain = 0.23;
-        c.chop_gain = 1.85;
-        c.slope_scale = 1.95;
-        c.curvature_gain = 0.78;
+        c.height_gain = 0.084;
+        c.chop_gain = 1.74;
+        c.slope_scale = 2.20;
+        c.curvature_gain = 0.82;
     } else if index == 2 {
         c.domain = 150.0;
-        c.height_gain = 0.13;
-        c.chop_gain = 1.45;
-        c.slope_scale = 2.75;
-        c.curvature_gain = 1.18;
+        c.height_gain = 0.120;
+        c.chop_gain = 2.14;
+        c.slope_scale = 4.00;
+        c.curvature_gain = 1.52;
     } else {
         c.domain = 62.0;
-        c.height_gain = 0.045;
-        c.chop_gain = 0.55;
-        c.slope_scale = 3.60;
-        c.curvature_gain = 1.75;
+        c.height_gain = 0.072;
+        c.chop_gain = 1.42;
+        c.slope_scale = 5.40;
+        c.curvature_gain = 2.42;
     }
 
     return c;
@@ -257,7 +257,7 @@ fn large_mid_foam_energy(p: vec2<f32>, w: WaveContrib) -> f32 {
     let lace = noise2(p * 0.240 + vec2<f32>(-t * 0.95, t * 0.51));
     let breakup = smoothstep(0.42, 0.82, wind_streak) * smoothstep(0.36, 0.74, lace);
 
-    return clamp(breaking * mix(0.045, 0.34, breakup), 0.0, 0.34);
+    return clamp(breaking * mix(0.030, 0.22, breakup), 0.0, 0.24);
 }
 
 @compute @workgroup_size(8, 8, 1)

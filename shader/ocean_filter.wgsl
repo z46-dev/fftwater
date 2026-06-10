@@ -77,7 +77,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // field pass: future FFT stages can write raw displacement/foam, then this
     // pass remains as the finite-value and foam-stability boundary before
     // shading. It also suppresses isolated white texel/square foam spikes.
-    var filtered = (c * 11.0 + (l + r + d + u) * 0.95 + (dl + dr + ul + ur) * 0.20) / 15.6;
+    var filtered = (c * 12.0 + (l + r + d + u) * 0.82 + (dl + dr + ul + ur) * 0.18) / 15.00;
     filtered = sanitize_field(filtered);
 
     let axial_foam = (l.w + r.w + d.w + u.w) * 0.25;
@@ -87,9 +87,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // If one texel says "full foam" but its neighbors do not, treat it as a
     // data-path spike rather than a breaking wave. Real crest foam should have
     // spatial support across nearby cells.
-    var foam = min(filtered.w, local_support * 1.25 + 0.006);
-    foam = smoothstep(0.055, 0.760, foam);
-    filtered.w = clamp(foam, 0.0, 0.42);
+    var foam = min(filtered.w, local_support * 1.12 + 0.004);
+    foam = smoothstep(0.090, 0.840, foam);
+    filtered.w = clamp(foam, 0.0, 0.24);
 
     textureStore(spectrum_filtered, p, filtered);
 }

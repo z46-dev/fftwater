@@ -38,3 +38,18 @@ var OceanSpectrumWGSL string
 //
 //go:embed ocean_filter.wgsl
 var OceanFilterWGSL string
+
+// OceanWaveDataWGSL derives WoWS-style gradient/moment/foam data from the
+// stabilized displacement field. The render shader consumes this instead of
+// reconstructing every material signal ad hoc.
+//
+//go:embed ocean_wavedata.wgsl
+var OceanWaveDataWGSL string
+
+// OceanFoamHistoryWGSL temporally accumulates FFT-derived foam and roughness.
+// It mirrors the WoWS-style g_foamEnergyInTexture/g_foamEnergyOutTexture path:
+// wave-data produces instantaneous breaking energy, then a separate pass advects,
+// fades, and breaks it up before the material samples it.
+//
+//go:embed ocean_foam_history.wgsl
+var OceanFoamHistoryWGSL string

@@ -20,8 +20,41 @@ const (
 	hudX      = 16
 	hudY      = 16
 	hudWidth  = 640
-	hudHeight = 166
+	hudHeight = 190
 )
+
+const (
+	debugModeFinal = iota
+	debugModeHeight
+	debugModeDisplacement
+	debugModeGradient
+	debugModeMoments
+	debugModeFoamHistory
+	debugModeVariation
+	debugModeRoughness
+	debugModeCount
+)
+
+func debugModeLabel(mode int) string {
+	switch mode {
+	case debugModeHeight:
+		return "height"
+	case debugModeDisplacement:
+		return "displacement"
+	case debugModeGradient:
+		return "gradient"
+	case debugModeMoments:
+		return "moments"
+	case debugModeFoamHistory:
+		return "foam history"
+	case debugModeVariation:
+		return "variation"
+	case debugModeRoughness:
+		return "roughness"
+	default:
+		return "final"
+	}
+}
 
 type inputDeltaAccumulator struct {
 	mu sync.Mutex
@@ -67,6 +100,8 @@ func Run(log *golog.Logger) error {
 		renderer      *WaterRenderer
 		pointerSource gpucontext.PointerEventSource
 		scrollSource  interface{ OnScroll(func(float64, float64)) }
+		debugMode     int
+		debugKeyDown  bool
 		ok            bool
 	)
 
@@ -80,7 +115,7 @@ func Run(log *golog.Logger) error {
 				return
 			}
 
-			look.Add(float32(ev.DeltaX), float32(ev.DeltaY))
+			look.Add(-float32(ev.DeltaX), -float32(ev.DeltaY))
 		})
 	}
 
@@ -97,6 +132,17 @@ func Run(log *golog.Logger) error {
 			gpuApp.SetCursorMode(gpucontext.CursorModeLocked)
 		} else if gpuApp.CursorMode() != gpucontext.CursorModeNormal {
 			gpuApp.SetCursorMode(gpucontext.CursorModeNormal)
+		}
+
+		if in != nil {
+			if in.Keyboard().Pressed(input.KeyTab) {
+				if !debugKeyDown {
+					debugMode = (debugMode + 1) % debugModeCount
+					debugKeyDown = true
+				}
+			} else {
+				debugKeyDown = false
+			}
 		}
 
 		var dx, dy float32
@@ -176,6 +222,8 @@ func Run(log *golog.Logger) error {
 			log.Infof("GoGPU backend: %s", dc.Backend())
 		}
 
+		renderer.SetDebugMode(debugMode)
+
 		if err = renderer.Draw(finalSurface, NewWaterFrame(surfaceW, surfaceH, float32(elapsed), aspect, cam)); err != nil {
 			log.Errorf("draw water: %v", err)
 			return
@@ -202,10 +250,11 @@ func Run(log *golog.Logger) error {
 		ctx.SetFillStyle(gctx2d.ColorWhite)
 		ctx.FillText(fmt.Sprintf("FPS: %d", fps), hudX+12, hudY+28)
 		ctx.FillText("GPU: "+gpuName, hudX+12, hudY+52)
-		ctx.FillText("Water: raw spectral field -> filtered field -> projected grid", hudX+12, hudY+76)
+		ctx.FillText("Water: FFT field -> wave-data -> foam history -> projected grid", hudX+12, hudY+76)
 		ctx.FillText(fmt.Sprintf("Cam: %.1f %.1f %.1f", cam.Position.X, cam.Position.Y, cam.Position.Z), hudX+12, hudY+100)
 		ctx.FillText(fmt.Sprintf("Time: %.2fs", elapsed), hudX+12, hudY+124)
 		ctx.FillText("Move: WASD, wheel zooms, Shift accelerates. Hold RMB to look", hudX+12, hudY+148)
+		ctx.FillText("Debug: "+debugModeLabel(debugMode)+" (Tab cycles views)", hudX+12, hudY+172)
 
 		if err = ctx.Flush(finalSurface, nil); err != nil {
 			log.Errorf("flush 2D HUD overlay: %v", err)

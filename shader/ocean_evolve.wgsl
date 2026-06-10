@@ -105,6 +105,23 @@ fn mode_to_k(ix: i32, iy: i32, cascade_index: i32) -> vec2<f32> {
     return vec2<f32>(f32(ix), f32(iy)) * (TAU / cascade_domain(cascade_index));
 }
 
+fn cascade_time_scale(index: i32) -> f32 {
+    // WoWS exposes per-layer wave speed/wind controls. Keep the long swell
+    // heavy and slower, while the mid/short domains evolve faster so the
+    // visible surface is made from counteracting moving trains rather than
+    // one slowly breathing height field.
+    if index == 0 {
+        return 0.70;
+    }
+    if index == 1 {
+        return 1.75;
+    }
+    if index == 2 {
+        return 3.25;
+    }
+    return 5.70;
+}
+
 fn coord_for_mode(ix: i32, iy: i32, cascade_index: i32, mode_dim: i32, total_h: i32) -> vec2<i32> {
     let coord = vec2<i32>(
         mode_to_index(ix, mode_dim),
@@ -161,7 +178,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // H(k,t) = H0(k) exp(i omega t) + conj(H0(-k)) exp(-i omega t).
     let omega = max(h0_k.z, sqrt(G * k_len));
-    let angle = omega * frame.resolution_time_grid.z;
+    let angle = omega * frame.resolution_time_grid.z * cascade_time_scale(cascade_index);
     let rot_pos = vec2<f32>(cos(angle), sin(angle));
     let rot_neg = vec2<f32>(cos(angle), -sin(angle));
 
