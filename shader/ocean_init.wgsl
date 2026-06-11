@@ -77,20 +77,20 @@ fn cascade_params(index: i32) -> CascadeParams {
         // visible broad motion, not huge single ridges.
         c.domain = 900.0;
         c.wind_speed = 27.0;
-        c.amplitude = 0.0000000062;
+        c.amplitude = 0.0000000086;
         c.damping = 0.00100;
         c.spread_back = 0.22;
-        c.max_h0 = 0.054;
+        c.max_h0 = 0.066;
         c.chop = 0.58;
     } else if index == 1 {
         // Cross chop / mid waves. This band is intentionally close in energy to
         // the swell so the surface has interference instead of one dominant set.
         c.domain = 360.0;
         c.wind_speed = 25.5;
-        c.amplitude = 0.000000080;
+        c.amplitude = 0.000000118;
         c.damping = 0.00190;
         c.spread_back = 0.42;
-        c.max_h0 = 0.145;
+        c.max_h0 = 0.176;
         c.chop = 0.92;
     } else if index == 2 {
         // Short wind waves. These should contribute slope and choppy texture
@@ -99,10 +99,10 @@ fn cascade_params(index: i32) -> CascadeParams {
         // to prevent the projected grid from folding near the camera.
         c.domain = 150.0;
         c.wind_speed = 21.0;
-        c.amplitude = 0.000000255;
+        c.amplitude = 0.000000225;
         c.damping = 0.00410;
         c.spread_back = 0.58;
-        c.max_h0 = 0.168;
+        c.max_h0 = 0.154;
         c.chop = 1.02;
     } else {
         // Micro cascade. Kept physically in the spectral data path instead of
@@ -110,10 +110,10 @@ fn cascade_params(index: i32) -> CascadeParams {
         // crest/normal source, not a large horizontal displacement source.
         c.domain = 62.0;
         c.wind_speed = 18.0;
-        c.amplitude = 0.000000245;
+        c.amplitude = 0.000000150;
         c.damping = 0.00820;
         c.spread_back = 0.78;
-        c.max_h0 = 0.118;
+        c.max_h0 = 0.086;
         c.chop = 0.66;
     }
 

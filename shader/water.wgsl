@@ -17,7 +17,7 @@ struct FrameUniforms {
     // x = spectrum origin world x, y = spectrum origin world z,
     // z = spectrum world span, w = spectrum texture dimension.
     spectrum_params: vec4<f32>,
-    // x = debug view mode, yzw reserved.
+    // x = debug view mode, y = coherent FFT/body height scale, zw reserved.
     water_params1: vec4<f32>,
 };
 
@@ -63,6 +63,7 @@ struct VertexOut {
     @location(4) field_height: f32,
     @location(5) wave_data: vec4<f32>,
     @location(6) foam_history: vec4<f32>,
+    @location(7) small_wave_detail: vec4<f32>,
 };
 
 struct WaveContrib {
@@ -172,30 +173,29 @@ fn crest_component(
     let omega = sqrt(G * k) * speed_scale;
     let t = frame.resolution_time_grid.z;
 
-    // Keep this layer coherent. WoWS small waves are dense crest trains riding
-    // on FFT water, not domain-warped checkerboard packets.  Use narrow crests
-    // with a small second harmonic so height has peaks without folding the mesh.
-    let theta = k * dot(p, d) - omega * t + phase;
+    // Clean, bounded crest primitive. Bend phase with smooth sinusoids in the
+    // cross-crest direction so the result is broken wavelets, not ruler-straight
+    // line trains or square packet masks.
+    let tangent = vec2<f32>(-d.y, d.x);
+    let along = dot(p, d);
+    let across = dot(p, tangent);
+    let phase_bend = sin(across * 0.031 + t * 0.20 + phase * 1.7) * 0.42
+                   + sin(across * 0.067 - t * 0.13 + phase * 2.3) * 0.18;
+    let theta = k * along - omega * t + phase + phase_bend;
     let s = sin(theta);
     let c = cos(theta);
-    let s2 = sin(theta * 2.0 + phase * 0.37);
-    let c2 = cos(theta * 2.0 + phase * 0.37);
-
     let pos = max(s, 0.0);
-    let neg = max(-s, 0.0);
-    let crest = pow(smoothstep(0.02, 1.0, pos), sharpness);
-    let trough = -0.20 * neg * neg;
-    let shoulder = 0.10 * s2;
+    let crest = pow(smoothstep(0.08, 1.0, pos), sharpness);
+    let trough = -0.18 * max(-s, 0.0) * max(-s, 0.0);
 
     let d_crest = select(0.0, sharpness * pow(max(pos, 0.0001), sharpness - 1.0) * c, pos > 0.0);
-    let d_trough = select(0.0, 0.40 * neg * c, neg > 0.0);
-    let d_height_dtheta = amplitude * (0.66 * c + 0.34 * d_crest + d_trough + 0.20 * c2);
+    let d_height_dtheta = amplitude * (0.60 * c + 0.40 * d_crest);
 
     var w: WaveContrib;
-    w.height = amplitude * (0.58 * s + 0.42 * crest + trough + shoulder);
-    w.disp = d * (amplitude * 0.018 * c);
+    w.height = amplitude * (0.52 * s + 0.48 * crest + trough);
+    w.disp = d * (amplitude * 0.006 * c);
     w.slope = d * (d_height_dtheta * k);
-    w.curvature = -amplitude * k * k * (0.58 * s + crest * (0.46 + sharpness * 0.10) + shoulder * 0.8);
+    w.curvature = -amplitude * k * k * (0.52 * s + crest * (0.48 + sharpness * 0.08));
     return w;
 }
 
@@ -203,47 +203,51 @@ fn wind_streak_variation(p: vec2<f32>) -> f32 {
     let wind = normalize(vec2<f32>(0.76, -0.65));
     let cross = vec2<f32>(-wind.y, wind.x);
     let t = frame.resolution_time_grid.z;
-    let q = vec2<f32>(dot(p, wind) * 0.0034 + t * 0.020, dot(p, cross) * 0.014 - t * 0.010);
-    let r = vec2<f32>(dot(p, wind) * 0.0090 - t * 0.055, dot(p, cross) * 0.028 + t * 0.020);
-    return smoothstep(0.18, 0.88, fbm2(q + vec2<f32>(13.0, -41.0)) * 0.65 + fbm2(r + vec2<f32>(-7.0, 19.0)) * 0.35);
+    // Smooth wind-space modulation only; no hard packet gates.  This avoids the
+    // square-looking foreground blocks while still varying where roughness lives.
+    let q = vec2<f32>(dot(p, wind) * 0.0028 + t * 0.014, dot(p, cross) * 0.0056 - t * 0.008);
+    let r = vec2<f32>(dot(p, wind) * 0.0074 - t * 0.030, dot(p, cross) * 0.0110 + t * 0.014);
+    return smoothstep(0.16, 0.86, fbm2(q + vec2<f32>(13.0, -41.0)) * 0.72 + fbm2(r + vec2<f32>(-7.0, 19.0)) * 0.28);
+}
+
+fn small_ridge_sample(p: vec2<f32>) -> f32 {
+    let t = frame.resolution_time_grid.z;
+    let wind = normalize(vec2<f32>(0.76, -0.65));
+    let cross = vec2<f32>(-wind.y, wind.x);
+    let q0 = vec2<f32>(dot(p, wind) * 0.030 + t * 0.055, dot(p, cross) * 0.052 - t * 0.028);
+    let q1 = vec2<f32>(dot(p, wind) * 0.062 - t * 0.095, dot(p, cross) * 0.038 + t * 0.041);
+    let n = fbm2(q0 + vec2<f32>(12.4, -31.8)) * 0.68 + fbm2(q1 + vec2<f32>(-7.1, 44.3)) * 0.32;
+    // Ridge-like but not line-like: this acts more like a generated variation /
+    // small-wave height texture than another set of analytic sine trains.
+    return pow(smoothstep(0.36, 0.92, n), 1.85);
 }
 
 fn small_wave_bank(p: vec2<f32>, view_distance: f32) -> WaveContrib {
     var w = empty_wave();
-    let t = frame.resolution_time_grid.z;
     let variation = wave_variation(p);
     let streak = wind_streak_variation(p);
-    let wind = normalize(vec2<f32>(0.76, -0.65));
-    let cross = vec2<f32>(-wind.y, wind.x);
 
-    // Smooth low-frequency drift, not per-wave packet gating. The prior domain
-    // warped crestlets created visible square/tiling artifacts. These waves are
-    // wind-aligned families with small angular spread, closer to the WoWS
-    // layering idea: short crests riding on FFT displacement and moments.
-    let warp = (fbm2(p * 0.010 + vec2<f32>(t * 0.020, -t * 0.015)) - 0.5) * wind * 5.0
-             + (fbm2(p * 0.013 + vec2<f32>(-t * 0.014, t * 0.018)) - 0.5) * cross * 3.0;
-    let q = p + warp;
+    // Keep geometry-safe small wave peaks near the camera.  The previous
+    // crestlet bank used explicit wave directions and inevitably read as lines.
+    // This is a smoother texture-like ridge field: it gives near detail and
+    // crest hints without imposing a visible crosshatch direction.
+    let near_gate = 1.0 - smoothstep(1050.0, 2600.0, view_distance);
+    let close_stabilize = smoothstep(10.0, 45.0, view_distance);
+    let gain = near_gate * close_stabilize * mix(0.72, 1.12, streak) * mix(0.88, 1.15, variation.z);
 
-    let near_gate = smoothstep(55.0, 150.0, view_distance);
-    let far_gate = 1.0 - smoothstep(2600.0, 7600.0, view_distance);
-    let gain = near_gate * far_gate * mix(0.78, 1.26, streak) * mix(0.90, 1.18, variation.z * 0.52 + variation.w * 0.48);
+    let e = 3.2;
+    let c = small_ridge_sample(p);
+    let l = small_ridge_sample(p - vec2<f32>(e, 0.0));
+    let r = small_ridge_sample(p + vec2<f32>(e, 0.0));
+    let d = small_ridge_sample(p - vec2<f32>(0.0, e));
+    let u = small_ridge_sample(p + vec2<f32>(0.0, e));
+    let slope = vec2<f32>((r - l) / (2.0 * e), (u - d) / (2.0 * e));
+    let lap = (l + r + d + u - 4.0 * c) / (e * e);
 
-    // Direction spread is deliberately narrow. Equal-strength perpendicular
-    // trains read as crosshatch; WoWS reads as wind-aligned rough sea with
-    // occasional counter ripples.
-    w = add_wave(w, crest_component(q + wind * (t * 3.2), normalize(wind + cross * 0.20), 42.0, 0.145, 1.55, 2.8, 0.9));
-    w = add_wave(w, crest_component(q - wind * (t * 1.7), normalize(wind - cross * 0.28), 29.0, 0.110, 2.15, 3.2, 2.7));
-    w = add_wave(w, crest_component(q + wind * (t * 5.1), normalize(wind + cross * 0.10), 20.0, 0.076, 2.85, 3.7, 4.1));
-    w = add_wave(w, crest_component(q - wind * (t * 4.4), normalize(-wind + cross * 0.18), 15.5, 0.040, 3.60, 4.0, 5.6));
-    w = add_wave(w, crest_component(q + wind * (t * 6.8), normalize(wind - cross * 0.08), 11.5, 0.026, 4.35, 4.4, 1.8));
-
-    w = scale_wave(w, gain);
-    // Small waves may contribute real peak height only where the grid can carry
-    // them. Horizontal displacement stays tiny to avoid folding/projected-grid
-    // slabs. Slope/curvature remain strong for normals and foam.
-    w.disp *= 0.10;
-    w.slope *= 1.05;
-    w.curvature *= 1.08;
+    w.height = (c - 0.22) * 0.115 * gain;
+    w.disp = slope * 0.012 * gain;
+    w.slope = slope * 2.15 * gain;
+    w.curvature = lap * 7.0 * gain;
     return sanitize_direct_wave(w);
 }
 
@@ -271,26 +275,41 @@ fn wave_component(
     return w;
 }
 
-fn spectrum_detail(p: vec2<f32>) -> WaveContrib {
+fn noise_gradient(q: vec2<f32>) -> vec2<f32> {
+    let e = 0.48;
+    let l = noise2(q - vec2<f32>(e, 0.0));
+    let r = noise2(q + vec2<f32>(e, 0.0));
+    let d = noise2(q - vec2<f32>(0.0, e));
+    let u = noise2(q + vec2<f32>(0.0, e));
+    return vec2<f32>(r - l, u - d) / (2.0 * e);
+}
+
+fn spectrum_detail(p: vec2<f32>, view_distance: f32) -> WaveContrib {
     var w = empty_wave();
     let t = frame.resolution_time_grid.z;
     let wind = normalize(vec2<f32>(0.76, -0.65));
     let cross = vec2<f32>(-wind.y, wind.x);
-    let warp = vec2<f32>(
-        fbm2(p * 0.045 + vec2<f32>(t * 0.060, -17.0)),
-        fbm2(p * 0.052 + vec2<f32>(31.0, -t * 0.050))
-    ) - vec2<f32>(0.5, 0.5);
-    let q = p + (wind * warp.x + cross * warp.y) * 3.6;
 
-    // Detail layer: wind-aligned small waves, not a symmetric cross set.
-    // This is normal/foam detail only; actual mesh peaks come from the cleaned
-    // short crest bank and coherent FFT cascades.
-    w = add_wave(w, wave_component(q + wind * ( t * 4.1), normalize(wind + cross * 0.24), 10.5, 0.038, 4.50, 0.18, 1.9));
-    w = add_wave(w, wave_component(q - wind * ( t * 3.0), normalize(wind - cross * 0.18),  7.2, 0.030, 5.80, 0.15, 3.7));
-    w = add_wave(w, wave_component(q + wind * ( t * 6.3), normalize(wind + cross * 0.08),  5.1, 0.021, 7.20, 0.12, 5.4));
-    w = add_wave(w, wave_component(q - wind * ( t * 7.8), normalize(-wind + cross * 0.14),  3.8, 0.013, 8.40, 0.08, 0.6));
-    w = add_wave(w, wave_component(q + wind * ( t * 9.0), normalize(wind - cross * 0.06),  2.7, 0.007, 10.0, 0.05, 2.8));
-    return w;
+    // WoWS carries small waves through wave/variation/detail textures.  This is
+    // the same idea in procedural form: filtered moving gradients, not another
+    // set of coherent sine lines.  It is intentionally used as normal/roughness
+    // detail, not significant vertex displacement.
+    let q0 = vec2<f32>(dot(p, wind) * 0.060 + t * 0.155, dot(p, cross) * 0.034 - t * 0.052);
+    let q1 = vec2<f32>(dot(p, wind) * 0.115 - t * 0.210, dot(p, cross) * 0.071 + t * 0.075);
+    let g0 = noise_gradient(q0 + vec2<f32>(3.1, -8.7));
+    let g1 = noise_gradient(q1 + vec2<f32>(-19.3, 6.8));
+    let n0 = noise2(q0 + vec2<f32>(41.0, -17.0));
+    let n1 = noise2(q1 + vec2<f32>(-5.0, 23.0));
+
+    let near = 1.0 - smoothstep(1400.0, 3600.0, view_distance);
+    let patch = mix(0.62, 1.08, smoothstep(0.22, 0.88, n0 * 0.55 + n1 * 0.45));
+    let world_slope = wind * (g0.x * 0.34 + g1.x * 0.18) + cross * (g0.y * 0.22 + g1.y * 0.14);
+
+    w.height = 0.0;
+    w.disp = vec2<f32>(0.0, 0.0);
+    w.slope = world_slope * patch * near;
+    w.curvature = length(world_slope) * 0.38 * near;
+    return sanitize_direct_wave(w);
 }
 
 fn hash21(p: vec2<f32>) -> f32 {
@@ -329,14 +348,15 @@ fn fbm2(p: vec2<f32>) -> f32 {
 }
 
 fn sea_shadow_variation(p: vec2<f32>) -> f32 {
-    // Low-frequency water/cloud shadow proxy. Keep it smooth and subtle: the
-    // last version exposed square value-noise blocks across the foreground.
+    // Smooth low-frequency water/cloud shadow proxy. One filtered noise sample
+    // is enough here; the multi-octave version cost fragment time and made far
+    // water shimmer when zoomed out.
     let t = frame.resolution_time_grid.z;
     let wind = normalize(vec2<f32>(0.76, -0.65));
     let cross = vec2<f32>(-wind.y, wind.x);
-    let q = vec2<f32>(dot(p, wind) * 0.0022 + t * 0.010, dot(p, cross) * 0.0034 - t * 0.006);
-    let m = fbm2(q + vec2<f32>(4.2, -11.7));
-    return mix(0.86, 1.04, smoothstep(0.18, 0.88, m));
+    let q = vec2<f32>(dot(p, wind) * 0.0016 + t * 0.004, dot(p, cross) * 0.0024 - t * 0.003);
+    let m = noise2(q + vec2<f32>(4.2, -11.7));
+    return mix(0.90, 1.02, smoothstep(0.20, 0.86, m));
 }
 
 fn spectrum_texel_size() -> f32 {
@@ -479,33 +499,33 @@ fn direct_cascade_params(index: i32) -> DirectCascadeParams {
         // Keep the long swell subordinate.  WoWS rough seas read from many
         // interacting wave bands, not one tall slow roller.
         c.domain = 900.0;
-        c.height_gain = 0.024;
-        c.chop_gain = 0.42;
+        c.height_gain = 0.052;
+        c.chop_gain = 0.30;
         c.slope_scale = 0.90;
         c.curvature_gain = 0.28;
     } else if index == 1 {
         // Mid/cross chop carries more visible geometry than the swell.
         c.domain = 360.0;
-        c.height_gain = 0.095;
-        c.chop_gain = 0.50;
+        c.height_gain = 0.185;
+        c.chop_gain = 0.32;
         c.slope_scale = 2.95;
         c.curvature_gain = 1.18;
     } else if index == 2 {
         // Short waves should be visible in silhouette/geometry close to the
         // camera, but not inflate the ocean into slow hills.
         c.domain = 150.0;
-        c.height_gain = 0.105;
-        c.chop_gain = 0.34;
-        c.slope_scale = 5.85;
-        c.curvature_gain = 2.20;
+        c.height_gain = 0.106;
+        c.chop_gain = 0.052;
+        c.slope_scale = 6.60;
+        c.curvature_gain = 2.65;
     } else {
         // Micro cascade: mostly normal/slope/crest definition with a small
         // amount of real geometry so the near surface is not flat.
         c.domain = 62.0;
-        c.height_gain = 0.026;
-        c.chop_gain = 0.08;
-        c.slope_scale = 8.20;
-        c.curvature_gain = 3.70;
+        c.height_gain = 0.000;
+        c.chop_gain = 0.000;
+        c.slope_scale = 9.20;
+        c.curvature_gain = 4.40;
     }
 
     return c;
@@ -603,7 +623,7 @@ fn direct_cascade_geometry_nearest(p: vec2<f32>, cascade_index: i32, mode_dim: i
     let aux = direct_sample_aux_nearest(p, cascade_index, mode_dim, total_h);
 
     var w: WaveContrib;
-    w.height = primary.x * c.height_gain;
+    w.height = primary.x * c.height_gain * frame.water_params1.y;
     w.disp = vec2<f32>(primary.z, aux.x) * c.chop_gain * frame.water_params0.y;
     w.slope = vec2<f32>(0.0, 0.0);
     w.curvature = aux.z * c.curvature_gain;
@@ -616,7 +636,7 @@ fn direct_cascade_geometry_smooth(p: vec2<f32>, cascade_index: i32, mode_dim: i3
     let aux = direct_sample_aux(p, cascade_index, mode_dim, total_h);
 
     var w: WaveContrib;
-    w.height = primary.x * c.height_gain;
+    w.height = primary.x * c.height_gain * frame.water_params1.y;
     w.disp = vec2<f32>(primary.z, aux.x) * c.chop_gain * frame.water_params0.y;
     w.slope = vec2<f32>(0.0, 0.0);
     w.curvature = aux.z * c.curvature_gain;
@@ -624,25 +644,13 @@ fn direct_cascade_geometry_smooth(p: vec2<f32>, cascade_index: i32, mode_dim: i3
 }
 
 fn direct_cascade_geometry_layered(p: vec2<f32>, cascade_index: i32, mode_dim: i32, total_h: i32, phase_shift: f32) -> WaveContrib {
-    let c = direct_cascade_params(cascade_index);
-    let t = frame.resolution_time_grid.z;
-
-    // Keep FFT geometry coherent. The previous rotated secondary/tertiary taps
-    // added motion, but they also made visible rectangular blocks when the
-    // projected grid sampled short cascades. WoWS uses multiple wave textures,
-    // gradients, and variation maps; until those are real independent fields,
-    // use one primary FFT sample plus one gentle wind-drifted tap.
-    let wind = normalize(vec2<f32>(0.76, -0.65));
-    let drift = wind * (t * c.domain * 0.018 * (1.0 + f32(cascade_index) * 0.45));
-    let primary = direct_cascade_geometry_smooth(p, cascade_index, mode_dim, total_h);
-    let secondary = direct_cascade_geometry_smooth(p + drift + vec2<f32>(phase_shift * 13.7, -phase_shift * 9.1), cascade_index, mode_dim, total_h);
-
-    var w: WaveContrib;
-    w.height = primary.height + secondary.height * 0.18;
-    w.disp = primary.disp + secondary.disp * 0.10;
-    w.slope = primary.slope + secondary.slope * 0.32;
-    w.curvature = primary.curvature + secondary.curvature * 0.38;
-    return sanitize_direct_wave(w);
+    // Keep render-time FFT sampling coherent and cheap.  The drifted secondary
+    // taps looked like extra activity, but they doubled texture-load cost and
+    // produced periodic/line artifacts.  WoWS gets variation from separate
+    // wave/gradient/moment/variation textures; until those are real resources,
+    // do not fake them by re-sampling the same tile in the vertex shader.
+    _ = phase_shift;
+    return direct_cascade_geometry_smooth(p, cascade_index, mode_dim, total_h);
 }
 
 fn weighted_add_wave(a: WaveContrib, b: WaveContrib, weight: f32) -> WaveContrib {
@@ -670,8 +678,11 @@ fn direct_fft_geometry_lod(p: vec2<f32>, view_distance: f32) -> WaveContrib {
     // different regions instead of every tile blending uniformly everywhere.
     let w0 = (1.0 - smoothstep(2600.0, 7200.0, view_distance)) * variation.x;
     let w1 = (1.0 - smoothstep(2200.0, 6400.0, view_distance)) * variation.y;
-    let w2 = (1.0 - smoothstep(1250.0, 3600.0, view_distance)) * variation.z;
-    let w3 = (1.0 - smoothstep(420.0, 1550.0, view_distance)) * variation.w;
+    let w2 = (1.0 - smoothstep(1050.0, 3000.0, view_distance)) * variation.z;
+    // Micro FFT is now a material/crest source, not a direct geometry source.
+    // Putting a 62m periodic tile into vertex displacement caused the distant
+    // light flicker and line aliasing when zoomed out.
+    let w3 = 0.0;
 
     if w0 > 0.001 {
         w = weighted_add_wave(w, direct_cascade_geometry_nearest(p, 0, mode_dim, total_h), w0);
@@ -691,10 +702,10 @@ fn direct_fft_geometry_lod(p: vec2<f32>, view_distance: f32) -> WaveContrib {
 
 fn sanitize_direct_wave(w: WaveContrib) -> WaveContrib {
     var r: WaveContrib;
-    r.height = finite_or(w.height, 0.0, 1.35);
-    r.disp = vec2<f32>(finite_or(w.disp.x, 0.0, 2.2), finite_or(w.disp.y, 0.0, 2.2));
+    r.height = finite_or(w.height, 0.0, 2.10);
+    r.disp = vec2<f32>(finite_or(w.disp.x, 0.0, 1.65), finite_or(w.disp.y, 0.0, 1.65));
     r.slope = vec2<f32>(finite_or(w.slope.x, 0.0, 3.2), finite_or(w.slope.y, 0.0, 3.2));
-    r.curvature = finite_or(w.curvature, 0.0, 0.30);
+    r.curvature = finite_or(w.curvature, 0.0, 0.42);
     return r;
 }
 
@@ -703,18 +714,20 @@ fn crest_shape_geometry(w: WaveContrib, view_distance: f32) -> WaveContrib {
     // Apply a bounded nonlinear crest lift to coherent FFT geometry, while
     // keeping horizontal chop conservative so the projected grid does not fold.
     var r = sanitize_direct_wave(w);
-    let slope_mag = length(r.slope);
-    let crest_by_curvature = smoothstep(0.018, 0.145, -r.curvature);
-    let crest_by_slope = smoothstep(0.28, 1.80, slope_mag);
-    let positive_height = smoothstep(-0.08, 0.34, r.height);
-    let near_mid_gate = 1.0 - smoothstep(1450.0, 3600.0, view_distance);
-    let crest_mask = crest_by_curvature * crest_by_slope * positive_height * near_mid_gate;
+    // The LOD render path does not carry true FFT slope for every cascade.
+    // Use curvature + positive height to sharpen peaks instead of multiplying
+    // by a zero slope signal. This gives visible crests without just scaling
+    // all heights up.
+    let crest_by_curvature = smoothstep(0.020, 0.135, -r.curvature);
+    let positive_height = smoothstep(-0.10, 0.32, r.height);
+    let near_mid_gate = smoothstep(28.0, 150.0, view_distance) * (1.0 - smoothstep(2100.0, 5200.0, view_distance));
+    let crest_mask = crest_by_curvature * positive_height * near_mid_gate;
 
-    let peak = min(max(r.height, 0.0) * 0.24 + 0.070, 0.26) * crest_mask;
-    r.height = finite_or(r.height + peak, 0.0, 1.80);
-    r.disp *= mix(1.0, 0.62, crest_mask);
-    r.slope *= 1.0 + crest_mask * 0.50;
-    r.curvature = finite_or(r.curvature - crest_mask * 0.035, 0.0, 0.42);
+    let peak = min(max(r.height, 0.0) * 0.30 + 0.075, 0.34) * crest_mask;
+    r.height = finite_or(r.height + peak, 0.0, 2.40);
+    r.disp *= mix(1.0, 0.68, crest_mask);
+    r.slope *= 1.0 + crest_mask * 0.58;
+    r.curvature = finite_or(r.curvature - crest_mask * 0.042, 0.0, 0.36);
     return r;
 }
 
@@ -724,7 +737,7 @@ fn direct_cascade_geometry(p: vec2<f32>, cascade_index: i32, mode_dim: i32, tota
     let aux = direct_sample_aux(p, cascade_index, mode_dim, total_h);
 
     var w: WaveContrib;
-    w.height = primary.x * c.height_gain;
+    w.height = primary.x * c.height_gain * frame.water_params1.y;
     w.disp = vec2<f32>(primary.z, aux.x) * c.chop_gain * frame.water_params0.y;
     w.slope = vec2<f32>(0.0, 0.0);
     w.curvature = aux.z * c.curvature_gain;
@@ -865,8 +878,11 @@ fn intersect_water_plane(ndc: vec2<f32>) -> vec2<f32> {
     // Camera-relative snap stabilizes distant projected vertices without
     // making the water pattern itself screen-space. The shader still samples
     // the field texture in absolute world coordinates.
-    let snap = max(frame.water_params0.x, 0.001);
-    return floor(hit.xz / snap) * snap;
+    let snap = frame.water_params0.x;
+    if (snap > 0.0001) {
+        return floor(hit.xz / snap) * snap;
+    }
+    return hit.xz;
 }
 
 @vertex
@@ -891,19 +907,17 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
     let shaped_direct = crest_shape_geometry(direct, base_view_distance);
     let crestlets = small_wave_bank(base_xz, base_view_distance);
     let far_weight = 1.0 - smoothstep(3600.0, 8600.0, base_view_distance);
-    // The first few meters under the camera are numerically fragile for a
-    // projected grid. Fade geometry there and let the material normal carry the
-    // foreground detail; this removes the large broken foreground polygons.
-    let near_stability = smoothstep(95.0, 280.0, base_view_distance);
+    // Do not use the expanded field texture as the near-camera displacement
+    // source. It is a low-frequency/filtered world field and becomes visible as
+    // square blocks in the foreground. Near and mid geometry come from coherent
+    // FFT tile samples; the expanded field fades in only for broad/far water.
+    let near_stability = smoothstep(8.0, 42.0, base_view_distance);
     let direct_weight = far_weight * near_stability;
-    let rough_lift = clamp(wave_data.z * 0.070 + foam_history.z * 0.026, 0.0, 0.10) * direct_weight;
-    // Sub-grid crest packets were producing foreground square artifacts when
-    // applied as full vertex displacement. Gate them out directly under the
-    // camera and only let a small amount affect mid-near geometry. Their main
-    // role is normals/foam, not projected-grid folding.
-    let crestlet_geo_gate = smoothstep(130.0, 360.0, base_view_distance) * (1.0 - smoothstep(1800.0, 5200.0, base_view_distance));
-    let geom_disp = mix(field.xz * 0.10, shaped_direct.disp * 0.72 * near_stability, direct_weight) + crestlets.disp * (0.018 * crestlet_geo_gate);
-    let geom_h = mix(field.y * 0.055, shaped_direct.height + rough_lift, direct_weight) + crestlets.height * (0.42 * crestlet_geo_gate);
+    let field_weight = smoothstep(1250.0, 3200.0, base_view_distance);
+    let rough_lift = clamp(wave_data.z * 0.030 + foam_history.z * 0.014, 0.0, 0.045) * field_weight;
+    let crestlet_geo_gate = smoothstep(45.0, 140.0, base_view_distance) * (1.0 - smoothstep(520.0, 1300.0, base_view_distance));
+    let geom_disp = shaped_direct.disp * (0.36 * direct_weight) + field.xz * (0.006 * field_weight) + crestlets.disp * (0.018 * crestlet_geo_gate);
+    let geom_h = shaped_direct.height * (1.06 * direct_weight) + field.y * (0.010 * field_weight * frame.water_params1.y) + rough_lift + crestlets.height * (0.46 * crestlet_geo_gate);
 
     let world = vec3<f32>(
         base_xz.x + geom_disp.x * edge_fade,
@@ -920,10 +934,11 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
     out.world_pos = world;
     out.base_xz = base_xz;
     out.view_distance = length(world - frame.camera_pos_fov.xyz);
-    out.foam_signal = clamp(foam_history.x * 0.66 + foam_history.z * 0.22 + wave_data.w * 0.20 + field.w * 0.030 + smoothstep(0.030, 0.180, -direct.curvature) * direct_weight * 0.13 + smoothstep(0.018, 0.088, -crestlets.curvature) * 0.22, 0.0, 1.0);
-    out.field_height = field.y;
+    out.foam_signal = clamp((foam_history.x * 0.42 + foam_history.z * 0.16 + wave_data.w * 0.16 + field.w * 0.020) * field_weight + smoothstep(0.030, 0.170, -direct.curvature) * direct_weight * 0.14 + smoothstep(0.018, 0.088, -crestlets.curvature) * 0.24, 0.0, 1.0);
+    out.field_height = world.y - water_y;
     out.wave_data = wave_data;
     out.foam_history = foam_history;
+    out.small_wave_detail = vec4<f32>(crestlets.slope, clamp(-crestlets.curvature * 2.2, 0.0, 1.0), clamp(length(crestlets.slope) * 0.54, 0.0, 1.0));
     return out;
 }
 
@@ -935,52 +950,49 @@ fn geometric_normal(world_pos: vec3<f32>) -> vec3<f32> {
     return n;
 }
 
-fn ocean_normal(world_pos: vec3<f32>, base_xz: vec2<f32>, wave_data: vec4<f32>, foam_history: vec4<f32>, view_distance: f32) -> vec3<f32> {
-    // Use screen-space derivatives of the displaced projected grid for the main
-    // water normal. This preserves FFT-backed geometry in the material without
-    // doing an expensive cascade-tile finite difference for every pixel.
+fn ocean_normal(world_pos: vec3<f32>, base_xz: vec2<f32>, wave_data: vec4<f32>, foam_history: vec4<f32>, small_wave_detail: vec4<f32>, view_distance: f32) -> vec3<f32> {
+    // Keep the fragment path cheap.  Vertex FFT supplies coherent body motion;
+    // this path adds nearby mini-wave roughness as a normal/detail signal.
     let geom = geometric_normal(world_pos);
-    let geom_slope = vec2<f32>(-geom.x, -geom.z) / max(geom.y, 0.18);
+    let geom_slope = vec2<f32>(-geom.x, -geom.z) / max(geom.y, 0.22);
 
-    let detail = spectrum_detail(base_xz * 1.05);
-    let counter_detail = spectrum_detail(base_xz * vec2<f32>(-0.73, 0.91) + vec2<f32>(37.0, -19.0));
-    let cross_detail = spectrum_detail(base_xz * vec2<f32>(0.46, -1.22) + vec2<f32>(-83.0, 41.0));
-    let crestlets = small_wave_bank(base_xz, view_distance);
-    let rough_memory = max(wave_data.z, foam_history.y * 0.88);
-    let coherent_detail_gate = smoothstep(0.020, 0.42, rough_memory + foam_history.z * 0.34);
-    // Keep the old detail waves as subtle surface roughness. The domain-warped
-    // crestlet layer now supplies the actual small wave peaks, avoiding the
-    // visible straight cross-lines from equal-strength sine sets.
-    let detail_slope = (detail.slope * 0.30 + counter_detail.slope * 0.20 + cross_detail.slope * 0.12) * frame.water_params0.w * coherent_detail_gate + crestlets.slope * 1.55;
-    let moment_slope = wave_data.xy * mix(1.10, 2.35, rough_memory);
-    let foam_suppression = 1.0 - foam_history.x * 0.20;
-    let slope = (geom_slope * 0.34 + moment_slope) * foam_suppression + detail_slope;
+    let detail = spectrum_detail(base_xz, view_distance);
+    let lowres_weight = smoothstep(1300.0, 3400.0, view_distance);
+    let near_micro = 1.0 - smoothstep(140.0, 1050.0, view_distance);
+    let far_stable = 1.0 - smoothstep(1400.0, 3200.0, view_distance);
+    let rough_memory = max(mix(0.10, wave_data.z, lowres_weight), foam_history.y * 0.50 * lowres_weight);
+    let coherent_gate = max(smoothstep(0.020, 0.36, rough_memory + foam_history.z * 0.16 * lowres_weight), near_micro * 0.78);
+
+    let vertex_short_slope = small_wave_detail.xy * (0.42 + near_micro * 0.38);
+    let capillary_slope = detail.slope * frame.water_params0.w * (0.22 + near_micro * 0.58) * coherent_gate * far_stable;
+    let moment_slope = (wave_data.xy * lowres_weight) * mix(0.62, 1.42, rough_memory);
+    let foam_suppression = 1.0 - foam_history.x * 0.18;
+    let slope = (geom_slope * 0.34 + moment_slope + vertex_short_slope + capillary_slope) * foam_suppression;
     return normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
 }
 
-fn crest_foam(base_xz: vec2<f32>, view_distance: f32, foam_signal: f32, wave_data: vec4<f32>, foam_history: vec4<f32>) -> f32 {
-    let detail = spectrum_detail(base_xz * 1.05);
-    let counter_detail = spectrum_detail(base_xz * vec2<f32>(-0.73, 0.91) + vec2<f32>(37.0, -19.0));
-    let cross_detail = spectrum_detail(base_xz * vec2<f32>(0.46, -1.22) + vec2<f32>(-83.0, 41.0));
-    let crestlets = small_wave_bank(base_xz, view_distance);
-    let crestlet_breaking = smoothstep(0.22, 0.98, length(crestlets.slope)) * smoothstep(0.020, 0.092, -crestlets.curvature);
-    let detail_breaking = smoothstep(0.24, 0.64, length(detail.slope * 0.28 + counter_detail.slope * 0.18 + cross_detail.slope * 0.12 + crestlets.slope * 0.92)) * smoothstep(0.014, 0.050, -(detail.curvature * 0.22 + counter_detail.curvature * 0.12 + cross_detail.curvature * 0.08 + crestlets.curvature * 0.76));
+fn crest_foam(base_xz: vec2<f32>, view_distance: f32, foam_signal: f32, wave_data: vec4<f32>, foam_history: vec4<f32>, small_wave_detail: vec4<f32>) -> f32 {
+    let short_energy = small_wave_detail.w;
+    let short_crest = small_wave_detail.z;
+    let detail_breaking = smoothstep(0.16, 0.62, short_energy) * smoothstep(0.018, 0.18, short_crest);
 
     let t = frame.resolution_time_grid.z;
-    let lace = noise2(base_xz * 0.420 + vec2<f32>(-t * 1.10, t * 0.52));
-    let breakup = mix(0.55, 1.0, smoothstep(0.30, 0.82, lace));
-    let distance_fade = 1.0 - smoothstep(2400.0, 6200.0, view_distance);
+    let lace = noise2(base_xz * 0.360 + vec2<f32>(-t * 0.82, t * 0.40));
+    let breakup = mix(0.50, 1.0, smoothstep(0.32, 0.86, lace));
+    let distance_fade = 1.0 - smoothstep(1500.0, 3800.0, view_distance);
 
-    let moment_foam = smoothstep(0.14, 0.60, max(wave_data.z, foam_history.y)) * max(wave_data.w, foam_history.z * 0.42);
-    let history_foam = foam_history.x * mix(0.66, 1.00, foam_history.w);
-    let instant_foam = foam_signal * 0.14 + moment_foam * 0.16 + detail_breaking * 0.050 + crestlet_breaking * 0.105;
-    return clamp((history_foam * 0.60 + instant_foam) * breakup * distance_fade * frame.water_params0.z, 0.0, 0.36);
+    let lowres_weight = smoothstep(1300.0, 3400.0, view_distance);
+    let moment_foam = smoothstep(0.14, 0.60, max(wave_data.z, foam_history.y)) * max(wave_data.w, foam_history.z * 0.42) * lowres_weight;
+    let history_foam = foam_history.x * mix(0.46, 0.76, foam_history.w) * lowres_weight;
+    let near_micro = 1.0 - smoothstep(220.0, 1300.0, view_distance);
+    let instant_foam = foam_signal * 0.08 + moment_foam * 0.08 + detail_breaking * (0.040 + near_micro * 0.035) + short_crest * (0.055 + near_micro * 0.045);
+    return clamp((history_foam * 0.40 + instant_foam) * breakup * distance_fade * frame.water_params0.z, 0.0, 0.26);
 }
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let cam = frame.camera_pos_fov.xyz;
-    let n = ocean_normal(in.world_pos, in.base_xz, in.wave_data, in.foam_history, in.view_distance);
+    let n = ocean_normal(in.world_pos, in.base_xz, in.wave_data, in.foam_history, in.small_wave_detail, in.view_distance);
     let view = normalize(cam - in.world_pos);
     let light = normalize(vec3<f32>(-0.42, 0.78, -0.46));
     let half_vec = normalize(light + view);
@@ -990,16 +1002,13 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let n_dot_h = clamp(dot(n, half_vec), 0.0, 1.0);
     let fresnel = 0.020 + 0.980 * pow(1.0 - n_dot_v, 5.0);
 
-    let detail = spectrum_detail(in.base_xz * 1.05);
-    let counter_detail = spectrum_detail(in.base_xz * vec2<f32>(-0.73, 0.91) + vec2<f32>(37.0, -19.0));
-    let cross_detail = spectrum_detail(in.base_xz * vec2<f32>(0.46, -1.22) + vec2<f32>(-83.0, 41.0));
-    let crestlets = small_wave_bank(in.base_xz, in.view_distance);
     let geom_slope_mag = length(vec2<f32>(-n.x, -n.z) / max(n.y, 0.18));
-    let material_roughness = max(in.wave_data.z, in.foam_history.y);
-    let detail_gate = smoothstep(0.020, 0.42, material_roughness + in.foam_history.z * 0.30);
-    let small_wave_energy = length(crestlets.slope) * 1.08 + smoothstep(0.020, 0.092, -crestlets.curvature) * 0.42;
-    let slope_mag = (length(detail.slope * 0.24 + counter_detail.slope * 0.17 + cross_detail.slope * 0.10) * detail_gate) + small_wave_energy + geom_slope_mag * 1.12 + material_roughness * 0.72;
-    let foam = crest_foam(in.base_xz, in.view_distance, in.foam_signal, in.wave_data, in.foam_history);
+    let lowres_material_weight = smoothstep(1300.0, 3400.0, in.view_distance);
+    let near_micro = 1.0 - smoothstep(220.0, 1350.0, in.view_distance);
+    let material_roughness = max(mix(0.14, in.wave_data.z, lowres_material_weight), in.foam_history.y * lowres_material_weight);
+    let small_wave_energy = (in.small_wave_detail.w * (0.78 + near_micro * 0.38) + in.small_wave_detail.z * (0.34 + near_micro * 0.16)) * (1.0 - smoothstep(1800.0, 4200.0, in.view_distance));
+    let slope_mag = small_wave_energy + geom_slope_mag * 0.86 + material_roughness * 0.52;
+    let foam = crest_foam(in.base_xz, in.view_distance, in.foam_signal, in.wave_data, in.foam_history, in.small_wave_detail);
 
     // Darker turbid/absorptive colors. The previous palette was too close to
     // the sky clear color, which erased the wave contrast. WoWS exposes
@@ -1013,9 +1022,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let zenith_sky = vec3<f32>(0.070, 0.145, 0.230);
 
     let distance_t = smoothstep(260.0, 5200.0, in.view_distance);
-    let height_t = clamp(in.field_height * 0.10 + 0.48, 0.0, 1.0);
+    let height_t = clamp(in.field_height * 0.16 + 0.48, 0.0, 1.0);
     let rough_shadow = 1.0 - smoothstep(0.24, 1.25, slope_mag) * (1.0 - n_dot_l) * 0.34;
-    let shadow_variation = sea_shadow_variation(in.base_xz);
+    let shadow_variation = mix(0.97, sea_shadow_variation(in.base_xz), smoothstep(900.0, 2800.0, in.view_distance));
     var volume = mix(body, deep, distance_t * 0.76);
     volume = mix(volume, lit_body, height_t * 0.26 * n_dot_l);
     volume = mix(volume, crest_tint, smoothstep(0.42, 1.45, slope_mag) * n_dot_l * 0.18);
@@ -1027,9 +1036,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 
     let roughness = clamp(0.115 + slope_mag * 0.34 + material_roughness * 0.48 + in.foam_history.z * 0.20 + foam * 0.50, 0.100, 0.88);
     let spec_power = mix(190.0, 18.0, roughness);
-    let wind_grain = noise2(in.base_xz * vec2<f32>(0.082, 0.38) + vec2<f32>(frame.resolution_time_grid.z * 0.26, -frame.resolution_time_grid.z * 1.24));
-    let sparkle_mask = smoothstep(0.72, 0.982, wind_grain) * (1.0 - foam * 0.76) * mix(0.80, 1.42, material_roughness);
-    let specular = pow(n_dot_h, spec_power) * (0.055 + sparkle_mask * 0.115) * n_dot_l * (1.0 - foam * 0.92);
+    let wind_grain = noise2(in.base_xz * vec2<f32>(0.050, 0.170) + vec2<f32>(frame.resolution_time_grid.z * 0.12, -frame.resolution_time_grid.z * 0.42));
+    let sparkle_distance = 1.0 - smoothstep(1200.0, 3200.0, in.view_distance);
+    let sparkle_mask = smoothstep(0.80, 0.992, wind_grain) * sparkle_distance * (1.0 - foam * 0.76) * mix(0.66, 1.05, material_roughness);
+    let specular = pow(n_dot_h, spec_power) * (0.040 + sparkle_mask * 0.075) * n_dot_l * (1.0 - foam * 0.92);
 
     // PMREM-like behavior: rough water should reflect a darker, blurrier sky;
     // only grazing angles get the broad pale horizon reflection.

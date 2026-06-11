@@ -11,18 +11,22 @@ import (
 )
 
 const (
-	waterGridCells           uint32  = 448
-	waterSpectrumTextureSize uint32  = 512
+	waterGridCells           uint32  = 192
+	waterSpectrumTextureSize uint32  = 256
 	waterModeTextureSize     uint32  = 64
 	waterModeCascadeCount    uint32  = 4
 	waterFFTStageCount               = 6
 	waterFrameUniformSize    uint64  = 192
 	waterMaxDistance         float32 = 120000.0
-	waterGridSnap            float32 = 0.001
-	waterChopScale           float32 = 0.96
-	waterFoamGain            float32 = 0.52
-	waterDetailGain          float32 = 1.58
-	waterSpectrumWorldSize   float32 = 3072.0
+	waterGridSnap            float32 = 0.0
+	waterChopScale           float32 = 0.72
+	waterFoamGain            float32 = 0.50
+	waterDetailGain          float32 = 1.18
+	// Height knob for quick tuning. This is packed into water_params1.y and
+	// intentionally scales coherent FFT body waves, not high-frequency
+	// capillary normal noise. Raise/lower this first when tuning sea state.
+	waterHeightScaleDefault float32 = 1.36
+	waterSpectrumWorldSize  float32 = 3072.0
 )
 
 // WaterFrame contains the per-frame inputs for the projected water grid.
@@ -32,10 +36,11 @@ const (
 // grid vertex, intersect that ray against the water plane, then displace and
 // shade the resulting world-space position.
 type WaterFrame struct {
-	Width     uint32
-	Height    uint32
-	Time      float32
-	DebugMode float32
+	Width           uint32
+	Height          uint32
+	Time            float32
+	DebugMode       float32
+	WaveHeightScale float32
 
 	Aspect      float32
 	TanHalfFOVY float32
@@ -96,6 +101,7 @@ type WaterRenderer struct {
 	device        *wgpu.Device
 	surfaceFormat wgpu.TextureFormat
 	debugMode     int
+	heightScale   float32
 
 	shaderModule            *wgpu.ShaderModule
 	initShaderModule        *wgpu.ShaderModule
@@ -206,6 +212,22 @@ func (r *WaterRenderer) SetDebugMode(mode int) {
 	r.debugMode = mode
 }
 
+func (r *WaterRenderer) SetWaveHeightScale(scale float32) {
+	if scale < 0.20 {
+		scale = 0.20
+	} else if scale > 3.00 {
+		scale = 3.00
+	}
+	r.heightScale = scale
+}
+
+func (r *WaterRenderer) WaveHeightScale() float32 {
+	if r == nil || r.heightScale <= 0 {
+		return waterHeightScaleDefault
+	}
+	return r.heightScale
+}
+
 func NewWaterRenderer(device *wgpu.Device, surfaceFormat wgpu.TextureFormat) (*WaterRenderer, error) {
 	if device == nil {
 		return nil, fmt.Errorf("nil wgpu device")
@@ -214,6 +236,7 @@ func NewWaterRenderer(device *wgpu.Device, surfaceFormat wgpu.TextureFormat) (*W
 	r := &WaterRenderer{
 		device:        device,
 		surfaceFormat: surfaceFormat,
+		heightScale:   waterHeightScaleDefault,
 	}
 
 	var err error
@@ -963,10 +986,11 @@ func (r *WaterRenderer) dispatchFFTChain(encoder *wgpu.CommandEncoder, label str
 }
 
 func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
-	frame.DebugMode = float32(r.debugMode)
 	if r == nil || r.device == nil {
 		return fmt.Errorf("water renderer is not initialized")
 	}
+	frame.DebugMode = float32(r.debugMode)
+	frame.WaveHeightScale = r.WaveHeightScale()
 
 	if target == nil {
 		return fmt.Errorf("nil water render target")
@@ -1116,7 +1140,7 @@ func packWaterFrame(frame WaterFrame) []byte {
 		frame.CameraForward.X, frame.CameraForward.Y, frame.CameraForward.Z, 0.0,
 		waterGridSnap, waterChopScale, waterFoamGain, waterDetailGain,
 		frame.SpectrumOriginX, frame.SpectrumOriginZ, frame.SpectrumWorldSize, frame.SpectrumTextureDim,
-		frame.DebugMode, 0.0, 0.0, 0.0,
+		frame.DebugMode, frame.WaveHeightScale, 0.0, 0.0,
 	)
 	return util.Float32Bytes(values...)
 }
