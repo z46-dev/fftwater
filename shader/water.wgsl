@@ -54,6 +54,14 @@ var wave_data_tex: texture_2d<f32>;
 @group(0) @binding(5)
 var foam_history_tex: texture_2d<f32>;
 
+// Generated static variation / foam-breakup texture.  It is the current
+// project equivalent of WoWS' g_variationTexture, g_spaceVariationTexture,
+// g_foamLowFreq, and g_foamHighFreq resources.
+// R = broad wave-band variation, G = roughness/wind streaks,
+// B = low-frequency foam breakup, A = high-frequency foam lace.
+@group(0) @binding(6)
+var variation_tex: texture_2d<f32>;
+
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
@@ -199,55 +207,124 @@ fn crest_component(
     return w;
 }
 
-fn wind_streak_variation(p: vec2<f32>) -> f32 {
-    let wind = normalize(vec2<f32>(0.76, -0.65));
-    let cross = vec2<f32>(-wind.y, wind.x);
-    let t = frame.resolution_time_grid.z;
-    // Smooth wind-space modulation only; no hard packet gates.  This avoids the
-    // square-looking foreground blocks while still varying where roughness lives.
-    let q = vec2<f32>(dot(p, wind) * 0.0028 + t * 0.014, dot(p, cross) * 0.0056 - t * 0.008);
-    let r = vec2<f32>(dot(p, wind) * 0.0074 - t * 0.030, dot(p, cross) * 0.0110 + t * 0.014);
-    return smoothstep(0.16, 0.86, fbm2(q + vec2<f32>(13.0, -41.0)) * 0.72 + fbm2(r + vec2<f32>(-7.0, 19.0)) * 0.28);
+fn sanitize_variation(v: vec4<f32>) -> vec4<f32> {
+    return clamp(v, vec4<f32>(0.0), vec4<f32>(1.0));
 }
 
-fn small_ridge_sample(p: vec2<f32>) -> f32 {
+fn sample_variation_uv(uv_in: vec2<f32>) -> vec4<f32> {
+    let dims = textureDimensions(variation_tex, 0);
+    let nx = max(i32(dims.x), 1);
+    let ny = max(i32(dims.y), 1);
+    let uv = fract(uv_in);
+    let coord = uv * vec2<f32>(f32(nx), f32(ny));
+    let i0 = vec2<i32>(floor(coord));
+    let f = smooth_interp2(fract(coord));
+
+    let x0 = ((i0.x % nx) + nx) % nx;
+    let y0 = ((i0.y % ny) + ny) % ny;
+    let x1 = (x0 + 1) % nx;
+    let y1 = (y0 + 1) % ny;
+
+    let a = textureLoad(variation_tex, vec2<i32>(x0, y0), 0);
+    let b = textureLoad(variation_tex, vec2<i32>(x1, y0), 0);
+    let c = textureLoad(variation_tex, vec2<i32>(x0, y1), 0);
+    let d = textureLoad(variation_tex, vec2<i32>(x1, y1), 0);
+    return sanitize_variation(mix(mix(a, b, f.x), mix(c, d, f.x), f.y));
+}
+
+fn sample_variation_world(p: vec2<f32>, scale: f32, offset: vec2<f32>) -> vec4<f32> {
+    return sample_variation_uv(p * scale + offset);
+}
+
+fn wind_streak_variation(p: vec2<f32>) -> f32 {
     let t = frame.resolution_time_grid.z;
+    let coarse = sample_variation_world(p, 0.00074, vec2<f32>(0.19 + t * 0.0020, -0.07 - t * 0.0012));
+    let fine = sample_variation_world(p, 0.00210, vec2<f32>(-0.31 - t * 0.0042, 0.41 + t * 0.0018));
+    return smoothstep(0.18, 0.88, coarse.g * 0.68 + fine.r * 0.32);
+}
+
+fn hash23(p: vec2<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        hash21(p + vec2<f32>(11.31, 47.17)),
+        hash21(p + vec2<f32>(73.77, -19.43)),
+        hash21(p + vec2<f32>(-29.51, 91.13))
+    );
+}
+
+fn packet_envelope(rel: vec2<f32>, dir: vec2<f32>, radius: f32, elongation: f32) -> f32 {
+    let tangent = vec2<f32>(-dir.y, dir.x);
+    let along = dot(rel, dir) / max(radius * elongation, 0.001);
+    let across = dot(rel, tangent) / max(radius, 0.001);
+    return exp(-(along * along * 0.64 + across * across * 1.35));
+}
+
+fn packet_wave(p: vec2<f32>, cell_id: vec2<f32>, cell_size: f32, view_distance: f32) -> WaveContrib {
+    let rnd = hash23(cell_id);
+    let rnd2 = hash23(cell_id + vec2<f32>(19.0, -31.0));
     let wind = normalize(vec2<f32>(0.76, -0.65));
-    let cross = vec2<f32>(-wind.y, wind.x);
-    let q0 = vec2<f32>(dot(p, wind) * 0.030 + t * 0.055, dot(p, cross) * 0.052 - t * 0.028);
-    let q1 = vec2<f32>(dot(p, wind) * 0.062 - t * 0.095, dot(p, cross) * 0.038 + t * 0.041);
-    let n = fbm2(q0 + vec2<f32>(12.4, -31.8)) * 0.68 + fbm2(q1 + vec2<f32>(-7.1, 44.3)) * 0.32;
-    // Ridge-like but not line-like: this acts more like a generated variation /
-    // small-wave height texture than another set of analytic sine trains.
-    return pow(smoothstep(0.36, 0.92, n), 1.85);
+    let random_dir = normalize(vec2<f32>(cos(rnd.z * TAU), sin(rnd.z * TAU)));
+
+    // Keep most packets wind-aligned, but not so aligned that they become
+    // parallel ruler lines.  This is a procedural substitute for WoWS'
+    // variation/spaceVariation maps plus high-frequency wave/foam textures.
+    let dir = normalize(mix(wind, random_dir, 0.22 + 0.30 * rnd2.x));
+    let center = (cell_id + vec2<f32>(0.18 + 0.64 * rnd.x, 0.18 + 0.64 * rnd.y)) * cell_size;
+    let rel = p - center;
+
+    let wavelength = mix(9.5, 24.0, rnd2.y);
+    let k = TAU / wavelength;
+    let t = frame.resolution_time_grid.z;
+    let phase = rnd2.z * TAU;
+    let speed = sqrt(G * k) * mix(0.64, 1.12, rnd.x);
+    let theta = dot(rel, dir) * k - speed * t + phase;
+
+    // Smooth local packet envelope; no square packet masks and no hard gates.
+    let radius = mix(22.0, 48.0, rnd.z);
+    let envelope = packet_envelope(rel, dir, radius, mix(1.10, 2.15, rnd2.x));
+
+    let s = sin(theta);
+    let c = cos(theta);
+    let pos = max(s, 0.0);
+    let crest = pow(smoothstep(0.05, 0.98, pos), mix(2.2, 3.9, rnd.y));
+    let trough = -0.16 * max(-s, 0.0) * max(-s, 0.0);
+
+    let near = 1.0 - smoothstep(1150.0, 2850.0, view_distance);
+    let close_stabilize = smoothstep(7.0, 36.0, view_distance);
+    let amp = mix(0.035, 0.135, rnd.x) * near * close_stabilize;
+
+    // Height is asymmetric: narrow crests and broad, shallow troughs.  This
+    // gets closer to the visible peak/crest behavior of choppy sea without
+    // adding another infinite sine-wave layer.
+    let profile = 0.38 * s + 0.72 * crest + trough - 0.035;
+    let dprofile = 0.38 * c + 0.72 * c * smoothstep(0.05, 0.98, pos);
+
+    let env_grad = -2.0 * rel / max(radius * radius, 1.0) * envelope;
+
+    var w: WaveContrib;
+    w.height = amp * envelope * profile;
+    w.disp = dir * (amp * 0.010 * c * envelope);
+    w.slope = dir * (amp * dprofile * k * envelope) + env_grad * (amp * profile);
+    w.curvature = -amp * k * k * envelope * (0.38 * s + 0.72 * crest);
+    return sanitize_direct_wave(w);
 }
 
 fn small_wave_bank(p: vec2<f32>, view_distance: f32) -> WaveContrib {
     var w = empty_wave();
-    let variation = wave_variation(p);
+    let cell_size = 34.0;
+    let base = floor(p / cell_size);
+
+    // Localized wave packets, not global wave lines.  Sum only nearby cells so
+    // this stays vertex-friendly.  The smooth envelope hides the cell layout.
+    for (var oy: i32 = -1; oy <= 1; oy = oy + 1) {
+        for (var ox: i32 = -1; ox <= 1; ox = ox + 1) {
+            let id = base + vec2<f32>(f32(ox), f32(oy));
+            let pw = packet_wave(p, id, cell_size, view_distance);
+            w = add_wave(w, pw);
+        }
+    }
+
     let streak = wind_streak_variation(p);
-
-    // Keep geometry-safe small wave peaks near the camera.  The previous
-    // crestlet bank used explicit wave directions and inevitably read as lines.
-    // This is a smoother texture-like ridge field: it gives near detail and
-    // crest hints without imposing a visible crosshatch direction.
-    let near_gate = 1.0 - smoothstep(1050.0, 2600.0, view_distance);
-    let close_stabilize = smoothstep(10.0, 45.0, view_distance);
-    let gain = near_gate * close_stabilize * mix(0.72, 1.12, streak) * mix(0.88, 1.15, variation.z);
-
-    let e = 3.2;
-    let c = small_ridge_sample(p);
-    let l = small_ridge_sample(p - vec2<f32>(e, 0.0));
-    let r = small_ridge_sample(p + vec2<f32>(e, 0.0));
-    let d = small_ridge_sample(p - vec2<f32>(0.0, e));
-    let u = small_ridge_sample(p + vec2<f32>(0.0, e));
-    let slope = vec2<f32>((r - l) / (2.0 * e), (u - d) / (2.0 * e));
-    let lap = (l + r + d + u - 4.0 * c) / (e * e);
-
-    w.height = (c - 0.22) * 0.115 * gain;
-    w.disp = slope * 0.012 * gain;
-    w.slope = slope * 2.15 * gain;
-    w.curvature = lap * 7.0 * gain;
+    w = scale_wave(w, mix(0.72, 1.22, streak));
     return sanitize_direct_wave(w);
 }
 
@@ -348,15 +425,12 @@ fn fbm2(p: vec2<f32>) -> f32 {
 }
 
 fn sea_shadow_variation(p: vec2<f32>) -> f32 {
-    // Smooth low-frequency water/cloud shadow proxy. One filtered noise sample
-    // is enough here; the multi-octave version cost fragment time and made far
-    // water shimmer when zoomed out.
+    // Variation-texture proxy for WoWS cloud/water-shadow modulation.  This is
+    // deliberately slow and broad; high-frequency far-water variation was the
+    // source of pale flicker in zoomed-out views.
     let t = frame.resolution_time_grid.z;
-    let wind = normalize(vec2<f32>(0.76, -0.65));
-    let cross = vec2<f32>(-wind.y, wind.x);
-    let q = vec2<f32>(dot(p, wind) * 0.0016 + t * 0.004, dot(p, cross) * 0.0024 - t * 0.003);
-    let m = noise2(q + vec2<f32>(4.2, -11.7));
-    return mix(0.90, 1.02, smoothstep(0.20, 0.86, m));
+    let v = sample_variation_world(p, 0.00036, vec2<f32>(0.11 + t * 0.0007, -0.29));
+    return mix(0.84, 1.015, smoothstep(0.14, 0.92, v.r * 0.75 + v.b * 0.25));
 }
 
 fn spectrum_texel_size() -> f32 {
@@ -364,19 +438,20 @@ fn spectrum_texel_size() -> f32 {
 }
 
 fn wave_variation(p: vec2<f32>) -> vec4<f32> {
-    // Smooth stand-in for WoWS variation/space-variation textures.  It should
-    // blend wave layers without drawing visible square blocks, so use fbm and
-    // conservative ranges instead of raw single-cell value noise.
-    let wind = normalize(vec2<f32>(0.76, -0.65));
-    let cross = vec2<f32>(-wind.y, wind.x);
-    let a = fbm2(vec2<f32>(dot(p, wind) * 0.0012, dot(p, cross) * 0.0017) + vec2<f32>(17.0, 31.0));
-    let b = fbm2(vec2<f32>(dot(p, wind) * 0.0030, dot(p, cross) * 0.0044) + vec2<f32>(-43.0, 11.0));
-    let c = fbm2(vec2<f32>(dot(p, wind) * 0.0070, dot(p, cross) * 0.0090) + vec2<f32>(9.0, -57.0));
-    let large = mix(0.88, 1.04, a);
-    let mid = mix(0.92, 1.22, b);
-    let shortv = mix(0.96, 1.36, c);
-    let micro = mix(0.96, 1.44, smoothstep(0.16, 0.86, b * 0.42 + c * 0.58));
-    return vec4<f32>(large, mid, shortv, micro);
+    // Texture-driven stand-in for WoWS variation/space-variation resources.
+    // This is intentionally smoother than the earlier procedural FBM: wave
+    // bands should fade through broad patches, not show grid-aligned blocks or
+    // procedural crosshatch.
+    let t = frame.resolution_time_grid.z;
+    let broad = sample_variation_world(p, 0.00052, vec2<f32>(0.07, 0.23));
+    let mid = sample_variation_world(p, 0.00145, vec2<f32>(-0.31 + t * 0.0016, 0.19));
+    let short_tex = sample_variation_world(p, 0.00380, vec2<f32>(0.47 - t * 0.0045, -0.13 + t * 0.0019));
+
+    let large = mix(0.90, 1.06, broad.r);
+    let midv = mix(0.88, 1.24, mid.g * 0.70 + broad.r * 0.30);
+    let shortv = mix(0.90, 1.42, short_tex.g * 0.62 + mid.g * 0.38);
+    let micro = mix(0.92, 1.34, short_tex.a * 0.50 + short_tex.b * 0.50);
+    return vec4<f32>(large, midv, shortv, micro);
 }
 
 
@@ -499,25 +574,25 @@ fn direct_cascade_params(index: i32) -> DirectCascadeParams {
         // Keep the long swell subordinate.  WoWS rough seas read from many
         // interacting wave bands, not one tall slow roller.
         c.domain = 900.0;
-        c.height_gain = 0.052;
-        c.chop_gain = 0.30;
-        c.slope_scale = 0.90;
-        c.curvature_gain = 0.28;
+        c.height_gain = 0.070;
+        c.chop_gain = 0.24;
+        c.slope_scale = 1.05;
+        c.curvature_gain = 0.34;
     } else if index == 1 {
         // Mid/cross chop carries more visible geometry than the swell.
         c.domain = 360.0;
-        c.height_gain = 0.185;
-        c.chop_gain = 0.32;
-        c.slope_scale = 2.95;
-        c.curvature_gain = 1.18;
+        c.height_gain = 0.225;
+        c.chop_gain = 0.27;
+        c.slope_scale = 3.25;
+        c.curvature_gain = 1.42;
     } else if index == 2 {
         // Short waves should be visible in silhouette/geometry close to the
         // camera, but not inflate the ocean into slow hills.
         c.domain = 150.0;
-        c.height_gain = 0.106;
-        c.chop_gain = 0.052;
-        c.slope_scale = 6.60;
-        c.curvature_gain = 2.65;
+        c.height_gain = 0.142;
+        c.chop_gain = 0.034;
+        c.slope_scale = 7.25;
+        c.curvature_gain = 3.05;
     } else {
         // Micro cascade: mostly normal/slope/crest definition with a small
         // amount of real geometry so the near surface is not flat.
@@ -915,9 +990,9 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
     let direct_weight = far_weight * near_stability;
     let field_weight = smoothstep(1250.0, 3200.0, base_view_distance);
     let rough_lift = clamp(wave_data.z * 0.030 + foam_history.z * 0.014, 0.0, 0.045) * field_weight;
-    let crestlet_geo_gate = smoothstep(45.0, 140.0, base_view_distance) * (1.0 - smoothstep(520.0, 1300.0, base_view_distance));
-    let geom_disp = shaped_direct.disp * (0.36 * direct_weight) + field.xz * (0.006 * field_weight) + crestlets.disp * (0.018 * crestlet_geo_gate);
-    let geom_h = shaped_direct.height * (1.06 * direct_weight) + field.y * (0.010 * field_weight * frame.water_params1.y) + rough_lift + crestlets.height * (0.46 * crestlet_geo_gate);
+    let crestlet_geo_gate = smoothstep(24.0, 74.0, base_view_distance) * (1.0 - smoothstep(980.0, 2200.0, base_view_distance));
+    let geom_disp = shaped_direct.disp * (0.30 * direct_weight) + field.xz * (0.004 * field_weight) + crestlets.disp * (0.026 * crestlet_geo_gate);
+    let geom_h = shaped_direct.height * (1.22 * direct_weight) + field.y * (0.006 * field_weight * frame.water_params1.y) + rough_lift + crestlets.height * (0.88 * crestlet_geo_gate);
 
     let world = vec3<f32>(
         base_xz.x + geom_disp.x * edge_fade,
@@ -938,7 +1013,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
     out.field_height = world.y - water_y;
     out.wave_data = wave_data;
     out.foam_history = foam_history;
-    out.small_wave_detail = vec4<f32>(crestlets.slope, clamp(-crestlets.curvature * 2.2, 0.0, 1.0), clamp(length(crestlets.slope) * 0.54, 0.0, 1.0));
+    out.small_wave_detail = vec4<f32>(crestlets.slope, clamp(-crestlets.curvature * 2.8, 0.0, 1.0), clamp(length(crestlets.slope) * 0.72, 0.0, 1.0));
     return out;
 }
 
@@ -977,16 +1052,17 @@ fn crest_foam(base_xz: vec2<f32>, view_distance: f32, foam_signal: f32, wave_dat
     let detail_breaking = smoothstep(0.16, 0.62, short_energy) * smoothstep(0.018, 0.18, short_crest);
 
     let t = frame.resolution_time_grid.z;
-    let lace = noise2(base_xz * 0.360 + vec2<f32>(-t * 0.82, t * 0.40));
-    let breakup = mix(0.50, 1.0, smoothstep(0.32, 0.86, lace));
+    let foam_breakup = sample_variation_world(base_xz, 0.0180, vec2<f32>(-t * 0.016, t * 0.008));
+    let breakup = mix(0.46, 1.0, smoothstep(0.28, 0.90, foam_breakup.b * 0.62 + foam_breakup.a * 0.38));
+    let lace_gate = smoothstep(0.44, 0.92, foam_breakup.a);
     let distance_fade = 1.0 - smoothstep(1500.0, 3800.0, view_distance);
 
     let lowres_weight = smoothstep(1300.0, 3400.0, view_distance);
     let moment_foam = smoothstep(0.14, 0.60, max(wave_data.z, foam_history.y)) * max(wave_data.w, foam_history.z * 0.42) * lowres_weight;
-    let history_foam = foam_history.x * mix(0.46, 0.76, foam_history.w) * lowres_weight;
+    let history_foam = foam_history.x * mix(0.32, 0.58, foam_history.w) * lowres_weight;
     let near_micro = 1.0 - smoothstep(220.0, 1300.0, view_distance);
-    let instant_foam = foam_signal * 0.08 + moment_foam * 0.08 + detail_breaking * (0.040 + near_micro * 0.035) + short_crest * (0.055 + near_micro * 0.045);
-    return clamp((history_foam * 0.40 + instant_foam) * breakup * distance_fade * frame.water_params0.z, 0.0, 0.26);
+    let instant_foam = foam_signal * 0.08 + moment_foam * 0.08 + detail_breaking * (0.034 + near_micro * 0.030) * mix(0.55, 1.18, lace_gate) + short_crest * (0.050 + near_micro * 0.040);
+    return clamp((history_foam * 0.30 + instant_foam) * breakup * distance_fade * frame.water_params0.z, 0.0, 0.22);
 }
 
 @fragment
@@ -1047,7 +1123,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     var color = mix(volume, sky, reflection_strength);
     color += specular * vec3<f32>(0.95, 0.88, 0.70);
 
-    let foam_color = vec3<f32>(0.42, 0.48, 0.44);
+    let foam_color = vec3<f32>(0.34, 0.40, 0.37);
     color = mix(color, foam_color, foam);
 
     let aerial = smoothstep(5200.0, 16000.0, in.view_distance);

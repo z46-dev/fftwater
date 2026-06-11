@@ -53,3 +53,11 @@ var OceanWaveDataWGSL string
 //
 //go:embed ocean_foam_history.wgsl
 var OceanFoamHistoryWGSL string
+
+// OceanVariationWGSL generates the static WoWS-style variation / foam-breakup
+// texture used by the water material. It stands in for g_variationTexture,
+// g_spaceVariationTexture, g_foamLowFreq, and g_foamHighFreq until those become
+// separate authored resources.
+//
+//go:embed ocean_variation.wgsl
+var OceanVariationWGSL string

@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	waterGridCells           uint32  = 192
+	waterGridCells           uint32  = 224
 	waterSpectrumTextureSize uint32  = 256
 	waterModeTextureSize     uint32  = 64
 	waterModeCascadeCount    uint32  = 4
@@ -19,13 +19,13 @@ const (
 	waterFrameUniformSize    uint64  = 192
 	waterMaxDistance         float32 = 120000.0
 	waterGridSnap            float32 = 0.0
-	waterChopScale           float32 = 0.72
+	waterChopScale           float32 = 0.66
 	waterFoamGain            float32 = 0.50
-	waterDetailGain          float32 = 1.18
+	waterDetailGain          float32 = 1.30
 	// Height knob for quick tuning. This is packed into water_params1.y and
 	// intentionally scales coherent FFT body waves, not high-frequency
 	// capillary normal noise. Raise/lower this first when tuning sea state.
-	waterHeightScaleDefault float32 = 1.36
+	waterHeightScaleDefault float32 = 1.62
 	waterSpectrumWorldSize  float32 = 3072.0
 )
 
@@ -111,6 +111,7 @@ type WaterRenderer struct {
 	filterShaderModule      *wgpu.ShaderModule
 	waveDataShaderModule    *wgpu.ShaderModule
 	foamHistoryShaderModule *wgpu.ShaderModule
+	variationShaderModule   *wgpu.ShaderModule
 
 	uniformBuffer *wgpu.Buffer
 
@@ -149,8 +150,11 @@ type WaterRenderer struct {
 	foamHistoryViewA     *wgpu.TextureView
 	foamHistoryTextureB  *wgpu.Texture
 	foamHistoryViewB     *wgpu.TextureView
+	variationTexture     *wgpu.Texture
+	variationView        *wgpu.TextureView
 
 	spectrumInitialized    bool
+	variationInitialized   bool
 	foamHistoryInitialized bool
 	foamHistoryFlip        bool
 
@@ -162,6 +166,7 @@ type WaterRenderer struct {
 	filterBindGroupLayout      *wgpu.BindGroupLayout
 	waveDataBindGroupLayout    *wgpu.BindGroupLayout
 	foamHistoryBindGroupLayout *wgpu.BindGroupLayout
+	variationBindGroupLayout   *wgpu.BindGroupLayout
 
 	renderPipelineLayout      *wgpu.PipelineLayout
 	initPipelineLayout        *wgpu.PipelineLayout
@@ -171,6 +176,7 @@ type WaterRenderer struct {
 	filterPipelineLayout      *wgpu.PipelineLayout
 	waveDataPipelineLayout    *wgpu.PipelineLayout
 	foamHistoryPipelineLayout *wgpu.PipelineLayout
+	variationPipelineLayout   *wgpu.PipelineLayout
 
 	renderBindGroupA *wgpu.BindGroup
 	renderBindGroupB *wgpu.BindGroup
@@ -190,6 +196,7 @@ type WaterRenderer struct {
 	waveDataBindGroup    *wgpu.BindGroup
 	foamHistoryAToBGroup *wgpu.BindGroup
 	foamHistoryBToAGroup *wgpu.BindGroup
+	variationBindGroup   *wgpu.BindGroup
 
 	renderPipeline                  *wgpu.RenderPipeline
 	initPipeline                    *wgpu.ComputePipeline
@@ -203,6 +210,7 @@ type WaterRenderer struct {
 	waveDataPipeline                *wgpu.ComputePipeline
 	foamHistoryPipeline             *wgpu.ComputePipeline
 	foamHistoryClearPipeline        *wgpu.ComputePipeline
+	variationPipeline               *wgpu.ComputePipeline
 }
 
 func (r *WaterRenderer) SetDebugMode(mode int) {
@@ -393,6 +401,14 @@ func (r *WaterRenderer) createResources() error {
 		return fmt.Errorf("create water temporal foam history shader module: %w", err)
 	}
 
+	r.variationShaderModule, err = r.device.CreateShaderModule(&wgpu.ShaderModuleDescriptor{
+		Label: "water variation and foam-breakup shader",
+		WGSL:  shader.OceanVariationWGSL,
+	})
+	if err != nil {
+		return fmt.Errorf("create water variation shader module: %w", err)
+	}
+
 	r.uniformBuffer, err = r.device.CreateBuffer(&wgpu.BufferDescriptor{
 		Label: "water frame uniforms",
 		Size:  waterFrameUniformSize,
@@ -462,6 +478,11 @@ func (r *WaterRenderer) createResources() error {
 		return fmt.Errorf("create water temporal foam history B texture: %w", err)
 	}
 
+	r.variationTexture, r.variationView, err = r.createSpectrumTexture("water variation foam breakup texture")
+	if err != nil {
+		return fmt.Errorf("create water variation foam breakup texture: %w", err)
+	}
+
 	r.renderBindGroupLayout, err = r.device.CreateBindGroupLayout(&wgpu.BindGroupLayoutDescriptor{
 		Label: "water render bind group layout",
 		Entries: []wgpu.BindGroupLayoutEntry{
@@ -471,6 +492,7 @@ func (r *WaterRenderer) createResources() error {
 			sampledFloatTextureLayoutEntry(3, wgpu.ShaderStageVertex|wgpu.ShaderStageFragment),
 			sampledFloatTextureLayoutEntry(4, wgpu.ShaderStageVertex|wgpu.ShaderStageFragment),
 			sampledFloatTextureLayoutEntry(5, wgpu.ShaderStageVertex|wgpu.ShaderStageFragment),
+			sampledFloatTextureLayoutEntry(6, wgpu.ShaderStageVertex|wgpu.ShaderStageFragment),
 		},
 	})
 	if err != nil {
@@ -563,6 +585,16 @@ func (r *WaterRenderer) createResources() error {
 		return fmt.Errorf("create water temporal foam history bind group layout: %w", err)
 	}
 
+	r.variationBindGroupLayout, err = r.device.CreateBindGroupLayout(&wgpu.BindGroupLayoutDescriptor{
+		Label: "water variation foam-breakup bind group layout",
+		Entries: []wgpu.BindGroupLayoutEntry{
+			writeRGBA32StorageTextureLayoutEntry(0, wgpu.ShaderStageCompute),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("create water variation bind group layout: %w", err)
+	}
+
 	r.renderPipelineLayout, err = r.device.CreatePipelineLayout(&wgpu.PipelineLayoutDescriptor{
 		Label:            "water render pipeline layout",
 		BindGroupLayouts: []*wgpu.BindGroupLayout{r.renderBindGroupLayout},
@@ -625,6 +657,14 @@ func (r *WaterRenderer) createResources() error {
 	})
 	if err != nil {
 		return fmt.Errorf("create water temporal foam history pipeline layout: %w", err)
+	}
+
+	r.variationPipelineLayout, err = r.device.CreatePipelineLayout(&wgpu.PipelineLayoutDescriptor{
+		Label:            "water variation foam-breakup pipeline layout",
+		BindGroupLayouts: []*wgpu.BindGroupLayout{r.variationBindGroupLayout},
+	})
+	if err != nil {
+		return fmt.Errorf("create water variation pipeline layout: %w", err)
 	}
 
 	r.initBindGroup, err = r.device.CreateBindGroup(&wgpu.BindGroupDescriptor{
@@ -731,6 +771,17 @@ func (r *WaterRenderer) createResources() error {
 	r.foamHistoryBToAGroup, err = r.createFoamHistoryBindGroup("water temporal foam history B-to-A bind group", r.foamHistoryViewB, r.foamHistoryViewA)
 	if err != nil {
 		return fmt.Errorf("create water temporal foam history B-to-A bind group: %w", err)
+	}
+
+	r.variationBindGroup, err = r.device.CreateBindGroup(&wgpu.BindGroupDescriptor{
+		Label:  "water variation foam-breakup bind group",
+		Layout: r.variationBindGroupLayout,
+		Entries: []wgpu.BindGroupEntry{
+			{Binding: 0, TextureView: r.variationView},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("create water variation bind group: %w", err)
 	}
 
 	r.renderBindGroupA, err = r.createRenderBindGroup("water render bind group A", r.foamHistoryViewA)
@@ -857,6 +908,16 @@ func (r *WaterRenderer) createResources() error {
 		return fmt.Errorf("create water temporal foam history clear pipeline: %w", err)
 	}
 
+	r.variationPipeline, err = r.device.CreateComputePipeline(&wgpu.ComputePipelineDescriptor{
+		Label:      "water variation foam-breakup pipeline",
+		Layout:     r.variationPipelineLayout,
+		Module:     r.variationShaderModule,
+		EntryPoint: "cs_main",
+	})
+	if err != nil {
+		return fmt.Errorf("create water variation pipeline: %w", err)
+	}
+
 	r.renderPipeline, err = r.device.CreateRenderPipeline(&wgpu.RenderPipelineDescriptor{
 		Label:  "water projected-grid pipeline",
 		Layout: r.renderPipelineLayout,
@@ -924,6 +985,7 @@ func (r *WaterRenderer) createRenderBindGroup(label string, foamHistory *wgpu.Te
 			{Binding: 3, TextureView: r.fftAuxPongView},
 			{Binding: 4, TextureView: r.waveDataView},
 			{Binding: 5, TextureView: foamHistory},
+			{Binding: 6, TextureView: r.variationView},
 		},
 	})
 }
@@ -1019,6 +1081,15 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 	}
 
 	didInitSpectrum := false
+	didInitVariation := false
+	if !r.variationInitialized {
+		if err = dispatchWaterComputePass(encoder, "water variation foam-breakup init pass", r.variationPipeline, r.variationBindGroup, (waterSpectrumTextureSize+7)/8, (waterSpectrumTextureSize+7)/8, 1); err != nil {
+			encoder.DiscardEncoding()
+			return err
+		}
+		didInitVariation = true
+	}
+
 	if !r.spectrumInitialized {
 		if err = dispatchWaterComputePass(encoder, "water h0 spectrum init pass", r.initPipeline, r.initBindGroup, (waterModeTextureSize+7)/8, (waterModeTextureSize*waterModeCascadeCount+7)/8, 1); err != nil {
 			encoder.DiscardEncoding()
@@ -1118,6 +1189,9 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 		return fmt.Errorf("submit water command buffer: %w", err)
 	}
 
+	if didInitVariation {
+		r.variationInitialized = true
+	}
 	if didInitSpectrum {
 		r.spectrumInitialized = true
 	}
@@ -1214,6 +1288,7 @@ func (r *WaterRenderer) Release() {
 	}
 
 	releaseRenderPipeline(&r.renderPipeline)
+	releaseComputePipeline(&r.variationPipeline)
 	releaseComputePipeline(&r.foamHistoryClearPipeline)
 	releaseComputePipeline(&r.foamHistoryPipeline)
 	releaseComputePipeline(&r.waveDataPipeline)
@@ -1232,6 +1307,7 @@ func (r *WaterRenderer) Release() {
 
 	releaseBindGroup(&r.renderBindGroupB)
 	releaseBindGroup(&r.renderBindGroupA)
+	releaseBindGroup(&r.variationBindGroup)
 	releaseBindGroup(&r.foamHistoryBToAGroup)
 	releaseBindGroup(&r.foamHistoryAToBGroup)
 	releaseBindGroup(&r.waveDataBindGroup)
@@ -1247,6 +1323,7 @@ func (r *WaterRenderer) Release() {
 	releaseBindGroup(&r.initBindGroup)
 
 	releasePipelineLayout(&r.renderPipelineLayout)
+	releasePipelineLayout(&r.variationPipelineLayout)
 	releasePipelineLayout(&r.foamHistoryPipelineLayout)
 	releasePipelineLayout(&r.waveDataPipelineLayout)
 	releasePipelineLayout(&r.filterPipelineLayout)
@@ -1256,6 +1333,7 @@ func (r *WaterRenderer) Release() {
 	releasePipelineLayout(&r.initPipelineLayout)
 
 	releaseBindGroupLayout(&r.renderBindGroupLayout)
+	releaseBindGroupLayout(&r.variationBindGroupLayout)
 	releaseBindGroupLayout(&r.foamHistoryBindGroupLayout)
 	releaseBindGroupLayout(&r.waveDataBindGroupLayout)
 	releaseBindGroupLayout(&r.filterBindGroupLayout)
@@ -1264,6 +1342,8 @@ func (r *WaterRenderer) Release() {
 	releaseBindGroupLayout(&r.evolveBindGroupLayout)
 	releaseBindGroupLayout(&r.initBindGroupLayout)
 
+	releaseTextureView(&r.variationView)
+	releaseTexture(&r.variationTexture)
 	releaseTextureView(&r.foamHistoryViewB)
 	releaseTexture(&r.foamHistoryTextureB)
 	releaseTextureView(&r.foamHistoryViewA)
@@ -1291,6 +1371,7 @@ func (r *WaterRenderer) Release() {
 
 	releaseBuffer(&r.uniformBuffer)
 
+	releaseShaderModule(&r.variationShaderModule)
 	releaseShaderModule(&r.foamHistoryShaderModule)
 	releaseShaderModule(&r.waveDataShaderModule)
 	releaseShaderModule(&r.filterShaderModule)

@@ -210,7 +210,7 @@ fn phillips_energy(k_vec: vec2<f32>, cascade_index: i32) -> f32 {
     let cross = directional_lobe(k_hat, cross_wind_dir_for_cascade(cascade_index), min(params.spread_back + 0.22, 0.85));
     let counter = directional_lobe(k_hat, counter_wind_dir_for_cascade(cascade_index), min(params.spread_back + 0.34, 0.95));
     let isotropic = 0.5 + 0.5 * abs(k_hat.x * k_hat.y);
-    let directional = max(0.115, primary * 0.10 + cross * 0.38 + counter * 0.38 + isotropic * 0.18);
+    let directional = max(0.105, primary * 0.52 + cross * 0.26 + counter * 0.14 + isotropic * 0.08);
 
     let largest_wave = params.wind_speed * params.wind_speed / G;
     let low_cut = exp(-1.0 / max(k2 * largest_wave * largest_wave, 0.000001));

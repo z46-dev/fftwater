@@ -20,7 +20,7 @@ const (
 	hudX      = 16
 	hudY      = 16
 	hudWidth  = 640
-	hudHeight = 190
+	hudHeight = 118
 )
 
 const (
@@ -250,11 +250,8 @@ func Run(log *golog.Logger) error {
 		ctx.SetFillStyle(gctx2d.ColorWhite)
 		ctx.FillText(fmt.Sprintf("FPS: %d", fps), hudX+12, hudY+28)
 		ctx.FillText("GPU: "+gpuName, hudX+12, hudY+52)
-		ctx.FillText("Water: FFT field -> wave-data -> foam history -> projected grid", hudX+12, hudY+76)
-		ctx.FillText(fmt.Sprintf("Cam: %.1f %.1f %.1f", cam.Position.X, cam.Position.Y, cam.Position.Z), hudX+12, hudY+100)
-		ctx.FillText(fmt.Sprintf("Time: %.2fs", elapsed), hudX+12, hudY+124)
-		ctx.FillText("Move: WASD, wheel zooms, Shift accelerates. Hold RMB to look", hudX+12, hudY+148)
-		ctx.FillText(fmt.Sprintf("Debug: %s (Tab cycles)  Height knob: %.2f", debugModeLabel(debugMode), renderer.WaveHeightScale()), hudX+12, hudY+172)
+		ctx.FillText(fmt.Sprintf("Cam: %.1f %.1f %.1f", cam.Position.X, cam.Position.Y, cam.Position.Z), hudX+12, hudY+76)
+		ctx.FillText(fmt.Sprintf("Time: %.2fs   Height: %.2f   View: %s", elapsed, renderer.WaveHeightScale(), debugModeLabel(debugMode)), hudX+12, hudY+100)
 
 		if err = ctx.Flush(finalSurface, nil); err != nil {
 			log.Errorf("flush 2D HUD overlay: %v", err)
