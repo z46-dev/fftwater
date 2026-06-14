@@ -1038,8 +1038,8 @@ fn ocean_normal(world_pos: vec3<f32>, base_xz: vec2<f32>, wave_data: vec4<f32>, 
     let rough_memory = max(mix(0.10, wave_data.z, lowres_weight), foam_history.y * 0.50 * lowres_weight);
     let coherent_gate = max(smoothstep(0.020, 0.36, rough_memory + foam_history.z * 0.16 * lowres_weight), near_micro * 0.78);
 
-    let vertex_short_slope = small_wave_detail.xy * (0.42 + near_micro * 0.38);
-    let capillary_slope = detail.slope * frame.water_params0.w * (0.22 + near_micro * 0.58) * coherent_gate * far_stable;
+    let vertex_short_slope = small_wave_detail.xy * (0.50 + near_micro * 0.54);
+    let capillary_slope = detail.slope * frame.water_params0.w * (0.30 + near_micro * 0.88) * coherent_gate * far_stable;
     let moment_slope = (wave_data.xy * lowres_weight) * mix(0.62, 1.42, rough_memory);
     let foam_suppression = 1.0 - foam_history.x * 0.18;
     let slope = (geom_slope * 0.34 + moment_slope + vertex_short_slope + capillary_slope) * foam_suppression;
@@ -1063,6 +1063,35 @@ fn crest_foam(base_xz: vec2<f32>, view_distance: f32, foam_signal: f32, wave_dat
     let near_micro = 1.0 - smoothstep(220.0, 1300.0, view_distance);
     let instant_foam = foam_signal * 0.08 + moment_foam * 0.08 + detail_breaking * (0.034 + near_micro * 0.030) * mix(0.55, 1.18, lace_gate) + short_crest * (0.050 + near_micro * 0.040);
     return clamp((history_foam * 0.30 + instant_foam) * breakup * distance_fade * frame.water_params0.z, 0.0, 0.22);
+}
+
+
+fn skybox_noise(p: vec2<f32>) -> f32 {
+    // Low-frequency, stable cloud signal.  Keep this very soft; high-frequency
+    // reflection noise reads as shimmer/flicker on distant water.
+    return fbm2(p * 0.72 + vec2<f32>(13.7, -4.2));
+}
+
+fn skybox_color_from_dir(dir_in: vec3<f32>, roughness: f32, world_xz: vec2<f32>) -> vec3<f32> {
+    let dir = normalize(dir_in);
+    let up = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+    let horizon = vec3<f32>(0.33, 0.43, 0.45);
+    let mid = vec3<f32>(0.18, 0.31, 0.40);
+    let zenith = vec3<f32>(0.055, 0.120, 0.190);
+    var sky = mix(horizon, mid, smoothstep(0.05, 0.58, up));
+    sky = mix(sky, zenith, smoothstep(0.50, 1.0, up));
+
+    let sun_dir = normalize(vec3<f32>(-0.36, 0.78, -0.50));
+    let sun_core = pow(max(dot(dir, sun_dir), 0.0), 340.0) * 1.25;
+    let sun_halo = pow(max(dot(dir, sun_dir), 0.0), 18.0) * 0.18;
+
+    let cloud_uv = dir.xz / max(0.10 + dir.y * 0.80, 0.12) + world_xz * 0.000030;
+    let cloud = smoothstep(0.48, 0.72, skybox_noise(cloud_uv));
+    let cloud_col = mix(vec3<f32>(0.30, 0.34, 0.34), vec3<f32>(0.72, 0.73, 0.68), up);
+    let rough_cloud = cloud * mix(0.30, 0.08, roughness);
+    sky = mix(sky, cloud_col, rough_cloud);
+    sky += vec3<f32>(1.0, 0.82, 0.55) * (sun_core + sun_halo * (1.0 - roughness * 0.65));
+    return max(sky, vec3<f32>(0.0));
 }
 
 @fragment
@@ -1094,8 +1123,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let body = vec3<f32>(0.005, 0.052, 0.066);
     let lit_body = vec3<f32>(0.026, 0.105, 0.098);
     let crest_tint = vec3<f32>(0.050, 0.132, 0.110);
-    let horizon_sky = vec3<f32>(0.20, 0.28, 0.31);
-    let zenith_sky = vec3<f32>(0.070, 0.145, 0.230);
+    let horizon_sky = vec3<f32>(0.24, 0.32, 0.34);
+    let zenith_sky = vec3<f32>(0.060, 0.130, 0.205);
 
     let distance_t = smoothstep(260.0, 5200.0, in.view_distance);
     let height_t = clamp(in.field_height * 0.16 + 0.48, 0.0, 1.0);
@@ -1107,19 +1136,21 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     volume *= rough_shadow * shadow_variation;
 
     let refl_dir = reflect(-view, n);
-    let sky_t = clamp(refl_dir.y * 0.52 + 0.38, 0.0, 1.0);
-    let sky = mix(horizon_sky, zenith_sky, sky_t);
 
-    let roughness = clamp(0.115 + slope_mag * 0.34 + material_roughness * 0.48 + in.foam_history.z * 0.20 + foam * 0.50, 0.100, 0.88);
+    let roughness = clamp(0.105 + slope_mag * 0.36 + material_roughness * 0.50 + in.foam_history.z * 0.18 + foam * 0.48, 0.095, 0.88);
+    let sky = skybox_color_from_dir(refl_dir, roughness, in.base_xz);
     let spec_power = mix(190.0, 18.0, roughness);
     let wind_grain = noise2(in.base_xz * vec2<f32>(0.050, 0.170) + vec2<f32>(frame.resolution_time_grid.z * 0.12, -frame.resolution_time_grid.z * 0.42));
     let sparkle_distance = 1.0 - smoothstep(1200.0, 3200.0, in.view_distance);
     let sparkle_mask = smoothstep(0.80, 0.992, wind_grain) * sparkle_distance * (1.0 - foam * 0.76) * mix(0.66, 1.05, material_roughness);
     let specular = pow(n_dot_h, spec_power) * (0.040 + sparkle_mask * 0.075) * n_dot_l * (1.0 - foam * 0.92);
 
-    // PMREM-like behavior: rough water should reflect a darker, blurrier sky;
-    // only grazing angles get the broad pale horizon reflection.
-    let reflection_strength = fresnel * mix(0.20, 0.46, 1.0 - roughness);
+    // PMREM-like behavior: rough water reflects a darker, blurrier sky while
+    // crest/slope-facing facets pick up more sky contrast.  This is the first
+    // lightweight stand-in for WoWS' reflection/PMREM texture path.
+    let crest_reflect = smoothstep(0.24, 1.15, slope_mag) * (0.035 + height_t * 0.030) * (1.0 - foam * 0.65);
+    let grazing_reflect = fresnel * mix(0.16, 0.50, 1.0 - roughness);
+    let reflection_strength = clamp(grazing_reflect + crest_reflect, 0.0, 0.58);
     var color = mix(volume, sky, reflection_strength);
     color += specular * vec3<f32>(0.95, 0.88, 0.70);
 

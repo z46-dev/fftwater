@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	waterGridCells           uint32  = 224
+	waterGridCells           uint32  = 240
 	waterSpectrumTextureSize uint32  = 256
 	waterModeTextureSize     uint32  = 64
 	waterModeCascadeCount    uint32  = 4
@@ -21,7 +21,7 @@ const (
 	waterGridSnap            float32 = 0.0
 	waterChopScale           float32 = 0.66
 	waterFoamGain            float32 = 0.50
-	waterDetailGain          float32 = 1.30
+	waterDetailGain          float32 = 1.44
 	// Height knob for quick tuning. This is packed into water_params1.y and
 	// intentionally scales coherent FFT body waves, not high-frequency
 	// capillary normal noise. Raise/lower this first when tuning sea state.
@@ -104,6 +104,7 @@ type WaterRenderer struct {
 	heightScale   float32
 
 	shaderModule            *wgpu.ShaderModule
+	skyShaderModule         *wgpu.ShaderModule
 	initShaderModule        *wgpu.ShaderModule
 	evolveShaderModule      *wgpu.ShaderModule
 	fftShaderModule         *wgpu.ShaderModule
@@ -159,6 +160,7 @@ type WaterRenderer struct {
 	foamHistoryFlip        bool
 
 	renderBindGroupLayout      *wgpu.BindGroupLayout
+	skyBindGroupLayout         *wgpu.BindGroupLayout
 	initBindGroupLayout        *wgpu.BindGroupLayout
 	evolveBindGroupLayout      *wgpu.BindGroupLayout
 	fftBindGroupLayout         *wgpu.BindGroupLayout
@@ -169,6 +171,7 @@ type WaterRenderer struct {
 	variationBindGroupLayout   *wgpu.BindGroupLayout
 
 	renderPipelineLayout      *wgpu.PipelineLayout
+	skyPipelineLayout         *wgpu.PipelineLayout
 	initPipelineLayout        *wgpu.PipelineLayout
 	evolvePipelineLayout      *wgpu.PipelineLayout
 	fftPipelineLayout         *wgpu.PipelineLayout
@@ -180,6 +183,7 @@ type WaterRenderer struct {
 
 	renderBindGroupA *wgpu.BindGroup
 	renderBindGroupB *wgpu.BindGroup
+	skyBindGroup     *wgpu.BindGroup
 	initBindGroup    *wgpu.BindGroup
 	evolveBindGroup  *wgpu.BindGroup
 
@@ -199,6 +203,7 @@ type WaterRenderer struct {
 	variationBindGroup   *wgpu.BindGroup
 
 	renderPipeline                  *wgpu.RenderPipeline
+	skyPipeline                     *wgpu.RenderPipeline
 	initPipeline                    *wgpu.ComputePipeline
 	evolvePipeline                  *wgpu.ComputePipeline
 	fftBitReverseHorizontalPipeline *wgpu.ComputePipeline
@@ -343,6 +348,14 @@ func (r *WaterRenderer) createResources() error {
 	})
 	if err != nil {
 		return fmt.Errorf("create water shader module: %w", err)
+	}
+
+	r.skyShaderModule, err = r.device.CreateShaderModule(&wgpu.ShaderModuleDescriptor{
+		Label: "procedural skybox shader",
+		WGSL:  shader.SkyWGSL,
+	})
+	if err != nil {
+		return fmt.Errorf("create skybox shader module: %w", err)
 	}
 
 	r.initShaderModule, err = r.device.CreateShaderModule(&wgpu.ShaderModuleDescriptor{
@@ -499,6 +512,16 @@ func (r *WaterRenderer) createResources() error {
 		return fmt.Errorf("create water render bind group layout: %w", err)
 	}
 
+	r.skyBindGroupLayout, err = r.device.CreateBindGroupLayout(&wgpu.BindGroupLayoutDescriptor{
+		Label: "skybox render bind group layout",
+		Entries: []wgpu.BindGroupLayoutEntry{
+			uniformLayoutEntry(wgpu.ShaderStageVertex | wgpu.ShaderStageFragment),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("create skybox render bind group layout: %w", err)
+	}
+
 	r.initBindGroupLayout, err = r.device.CreateBindGroupLayout(&wgpu.BindGroupLayoutDescriptor{
 		Label: "water h0 init bind group layout",
 		Entries: []wgpu.BindGroupLayoutEntry{
@@ -601,6 +624,14 @@ func (r *WaterRenderer) createResources() error {
 	})
 	if err != nil {
 		return fmt.Errorf("create water render pipeline layout: %w", err)
+	}
+
+	r.skyPipelineLayout, err = r.device.CreatePipelineLayout(&wgpu.PipelineLayoutDescriptor{
+		Label:            "skybox render pipeline layout",
+		BindGroupLayouts: []*wgpu.BindGroupLayout{r.skyBindGroupLayout},
+	})
+	if err != nil {
+		return fmt.Errorf("create skybox render pipeline layout: %w", err)
 	}
 
 	r.initPipelineLayout, err = r.device.CreatePipelineLayout(&wgpu.PipelineLayoutDescriptor{
@@ -794,6 +825,17 @@ func (r *WaterRenderer) createResources() error {
 		return fmt.Errorf("create water render bind group B: %w", err)
 	}
 
+	r.skyBindGroup, err = r.device.CreateBindGroup(&wgpu.BindGroupDescriptor{
+		Label:  "skybox render bind group",
+		Layout: r.skyBindGroupLayout,
+		Entries: []wgpu.BindGroupEntry{
+			{Binding: 0, Buffer: r.uniformBuffer, Size: waterFrameUniformSize},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("create skybox render bind group: %w", err)
+	}
+
 	r.initPipeline, err = r.device.CreateComputePipeline(&wgpu.ComputePipelineDescriptor{
 		Label:      "water h0 init pipeline",
 		Layout:     r.initPipelineLayout,
@@ -916,6 +958,34 @@ func (r *WaterRenderer) createResources() error {
 	})
 	if err != nil {
 		return fmt.Errorf("create water variation pipeline: %w", err)
+	}
+
+	r.skyPipeline, err = r.device.CreateRenderPipeline(&wgpu.RenderPipelineDescriptor{
+		Label:  "procedural skybox pipeline",
+		Layout: r.skyPipelineLayout,
+		Vertex: wgpu.VertexState{
+			Module:     r.skyShaderModule,
+			EntryPoint: "vs_main",
+		},
+		Primitive: wgpu.PrimitiveState{
+			Topology:  gputypes.PrimitiveTopologyTriangleList,
+			FrontFace: gputypes.FrontFaceCCW,
+			CullMode:  gputypes.CullModeNone,
+		},
+		Multisample: gputypes.DefaultMultisampleState(),
+		Fragment: &wgpu.FragmentState{
+			Module:     r.skyShaderModule,
+			EntryPoint: "fs_main",
+			Targets: []wgpu.ColorTargetState{
+				{
+					Format:    r.surfaceFormat,
+					WriteMask: gputypes.ColorWriteMaskAll,
+				},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("create skybox render pipeline: %w", err)
 	}
 
 	r.renderPipeline, err = r.device.CreateRenderPipeline(&wgpu.RenderPipelineDescriptor{
@@ -1170,6 +1240,10 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 		return fmt.Errorf("begin water render pass: %w", err)
 	}
 
+	pass.SetPipeline(r.skyPipeline)
+	pass.SetBindGroup(0, r.skyBindGroup, nil)
+	pass.Draw(3, 1, 0, 0)
+
 	pass.SetPipeline(r.renderPipeline)
 	pass.SetBindGroup(0, renderBindGroup, nil)
 	pass.Draw(waterGridCells*waterGridCells*6, 1, 0, 0)
@@ -1288,6 +1362,7 @@ func (r *WaterRenderer) Release() {
 	}
 
 	releaseRenderPipeline(&r.renderPipeline)
+	releaseRenderPipeline(&r.skyPipeline)
 	releaseComputePipeline(&r.variationPipeline)
 	releaseComputePipeline(&r.foamHistoryClearPipeline)
 	releaseComputePipeline(&r.foamHistoryPipeline)
@@ -1307,6 +1382,7 @@ func (r *WaterRenderer) Release() {
 
 	releaseBindGroup(&r.renderBindGroupB)
 	releaseBindGroup(&r.renderBindGroupA)
+	releaseBindGroup(&r.skyBindGroup)
 	releaseBindGroup(&r.variationBindGroup)
 	releaseBindGroup(&r.foamHistoryBToAGroup)
 	releaseBindGroup(&r.foamHistoryAToBGroup)
@@ -1323,6 +1399,7 @@ func (r *WaterRenderer) Release() {
 	releaseBindGroup(&r.initBindGroup)
 
 	releasePipelineLayout(&r.renderPipelineLayout)
+	releasePipelineLayout(&r.skyPipelineLayout)
 	releasePipelineLayout(&r.variationPipelineLayout)
 	releasePipelineLayout(&r.foamHistoryPipelineLayout)
 	releasePipelineLayout(&r.waveDataPipelineLayout)
@@ -1333,6 +1410,7 @@ func (r *WaterRenderer) Release() {
 	releasePipelineLayout(&r.initPipelineLayout)
 
 	releaseBindGroupLayout(&r.renderBindGroupLayout)
+	releaseBindGroupLayout(&r.skyBindGroupLayout)
 	releaseBindGroupLayout(&r.variationBindGroupLayout)
 	releaseBindGroupLayout(&r.foamHistoryBindGroupLayout)
 	releaseBindGroupLayout(&r.waveDataBindGroupLayout)
@@ -1379,5 +1457,6 @@ func (r *WaterRenderer) Release() {
 	releaseShaderModule(&r.fftShaderModule)
 	releaseShaderModule(&r.evolveShaderModule)
 	releaseShaderModule(&r.initShaderModule)
+	releaseShaderModule(&r.skyShaderModule)
 	releaseShaderModule(&r.shaderModule)
 }
