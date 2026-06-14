@@ -25,8 +25,9 @@ const (
 	// Height knob for quick tuning. This is packed into water_params1.y and
 	// intentionally scales coherent FFT body waves, not high-frequency
 	// capillary normal noise. Raise/lower this first when tuning sea state.
-	waterHeightScaleDefault float32 = 1.62
-	waterSpectrumWorldSize  float32 = 3072.0
+	waterHeightScaleDefault float32            = 1.62
+	waterSpectrumWorldSize  float32            = 3072.0
+	shipDepthFormat         wgpu.TextureFormat = gputypes.TextureFormatDepth32Float
 )
 
 // WaterFrame contains the per-frame inputs for the projected water grid.
@@ -113,6 +114,12 @@ type WaterRenderer struct {
 	waveDataShaderModule    *wgpu.ShaderModule
 	foamHistoryShaderModule *wgpu.ShaderModule
 	variationShaderModule   *wgpu.ShaderModule
+
+	shipRenderer     *ShipRenderer
+	shipDepthTexture *wgpu.Texture
+	shipDepthView    *wgpu.TextureView
+	shipDepthWidth   uint32
+	shipDepthHeight  uint32
 
 	uniformBuffer *wgpu.Buffer
 
@@ -950,6 +957,11 @@ func (r *WaterRenderer) createResources() error {
 		return fmt.Errorf("create water temporal foam history clear pipeline: %w", err)
 	}
 
+	r.shipRenderer, err = NewShipRenderer(r.device, r.surfaceFormat, defaultShipModelPath)
+	if err != nil {
+		return fmt.Errorf("create ship renderer: %w", err)
+	}
+
 	r.variationPipeline, err = r.device.CreateComputePipeline(&wgpu.ComputePipelineDescriptor{
 		Label:      "water variation foam-breakup pipeline",
 		Layout:     r.variationPipelineLayout,
@@ -1117,6 +1129,46 @@ func (r *WaterRenderer) dispatchFFTChain(encoder *wgpu.CommandEncoder, label str
 	return nil
 }
 
+func (r *WaterRenderer) ensureShipDepth(width, height uint32) error {
+	if r.shipDepthView != nil && r.shipDepthWidth == width && r.shipDepthHeight == height {
+		return nil
+	}
+	releaseTextureView(&r.shipDepthView)
+	releaseTexture(&r.shipDepthTexture)
+
+	tex, err := r.device.CreateTexture(&wgpu.TextureDescriptor{
+		Label:         "ship depth texture",
+		Size:          wgpu.Extent3D{Width: width, Height: height, DepthOrArrayLayers: 1},
+		MipLevelCount: 1,
+		SampleCount:   1,
+		Dimension:     wgpu.TextureDimension2D,
+		Format:        shipDepthFormat,
+		Usage:         wgpu.TextureUsageRenderAttachment,
+	})
+	if err != nil {
+		return fmt.Errorf("create ship depth texture: %w", err)
+	}
+	view, err := r.device.CreateTextureView(tex, &wgpu.TextureViewDescriptor{
+		Label:           "ship depth view",
+		Format:          shipDepthFormat,
+		Dimension:       gputypes.TextureViewDimension2D,
+		Aspect:          gputypes.TextureAspectAll,
+		BaseMipLevel:    0,
+		MipLevelCount:   1,
+		BaseArrayLayer:  0,
+		ArrayLayerCount: 1,
+	})
+	if err != nil {
+		tex.Release()
+		return fmt.Errorf("create ship depth view: %w", err)
+	}
+	r.shipDepthTexture = tex
+	r.shipDepthView = view
+	r.shipDepthWidth = width
+	r.shipDepthHeight = height
+	return nil
+}
+
 func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 	if r == nil || r.device == nil {
 		return fmt.Errorf("water renderer is not initialized")
@@ -1130,6 +1182,9 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 
 	if frame.Width == 0 || frame.Height == 0 {
 		return nil
+	}
+	if err := r.ensureShipDepth(frame.Width, frame.Height); err != nil {
+		return err
 	}
 
 	uniformBytes := packWaterFrame(frame)
@@ -1234,6 +1289,12 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 				ClearValue: gputypes.Color{R: 0.11, G: 0.18, B: 0.22, A: 1.0},
 			},
 		},
+		DepthStencilAttachment: &wgpu.RenderPassDepthStencilAttachment{
+			View:            r.shipDepthView,
+			DepthLoadOp:     gputypes.LoadOpClear,
+			DepthStoreOp:    gputypes.StoreOpStore,
+			DepthClearValue: 1.0,
+		},
 	})
 	if err != nil {
 		encoder.DiscardEncoding()
@@ -1251,6 +1312,34 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 	if err = pass.End(); err != nil {
 		encoder.DiscardEncoding()
 		return fmt.Errorf("end water render pass: %w", err)
+	}
+
+	if r.shipRenderer != nil {
+		shipPass, err := encoder.BeginRenderPass(&wgpu.RenderPassDescriptor{
+			Label: "ship render pass",
+			ColorAttachments: []wgpu.RenderPassColorAttachment{
+				{
+					View:    target,
+					LoadOp:  gputypes.LoadOpLoad,
+					StoreOp: gputypes.StoreOpStore,
+				},
+			},
+			DepthStencilAttachment: &wgpu.RenderPassDepthStencilAttachment{
+				View:            r.shipDepthView,
+				DepthLoadOp:     gputypes.LoadOpClear,
+				DepthStoreOp:    gputypes.StoreOpStore,
+				DepthClearValue: 1.0,
+			},
+		})
+		if err != nil {
+			encoder.DiscardEncoding()
+			return fmt.Errorf("begin ship render pass: %w", err)
+		}
+		r.shipRenderer.Draw(shipPass, frame)
+		if err = shipPass.End(); err != nil {
+			encoder.DiscardEncoding()
+			return fmt.Errorf("end ship render pass: %w", err)
+		}
 	}
 
 	cmd, err := encoder.Finish()
@@ -1360,6 +1449,13 @@ func (r *WaterRenderer) Release() {
 	if r == nil {
 		return
 	}
+
+	if r.shipRenderer != nil {
+		r.shipRenderer.Release()
+		r.shipRenderer = nil
+	}
+	releaseTextureView(&r.shipDepthView)
+	releaseTexture(&r.shipDepthTexture)
 
 	releaseRenderPipeline(&r.renderPipeline)
 	releaseRenderPipeline(&r.skyPipeline)
