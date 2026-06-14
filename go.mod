@@ -3,7 +3,7 @@ module github.com/z46-dev/fftwater
 go 1.26.2
 
 require (
-	github.com/gogpu/gogpu v0.41.9
+	github.com/gogpu/gogpu v0.41.11
 	github.com/gogpu/gpucontext v0.19.0
 	github.com/gogpu/gputypes v0.5.0
 	github.com/gogpu/wgpu v0.29.14
