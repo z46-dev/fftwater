@@ -15,34 +15,40 @@ var<uniform> frame: FrameUniforms;
 
 struct SkyOut {
     @builtin(position) position: vec4<f32>,
-    @location(0) ray: vec3<f32>,
+    @location(0) ndc: vec2<f32>,
 };
 
-fn hash21(p: vec2<f32>) -> f32 {
-    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453123);
+fn hash31(p: vec3<f32>) -> f32 {
+    return fract(sin(dot(p, vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453123);
 }
 
-fn noise2(p: vec2<f32>) -> f32 {
+fn noise3(p: vec3<f32>) -> f32 {
     let i = floor(p);
     let f = fract(p);
-    let u = f * f * (vec2<f32>(3.0, 3.0) - 2.0 * f);
-    let a = hash21(i + vec2<f32>(0.0, 0.0));
-    let b = hash21(i + vec2<f32>(1.0, 0.0));
-    let c = hash21(i + vec2<f32>(0.0, 1.0));
-    let d = hash21(i + vec2<f32>(1.0, 1.0));
-    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+    // Quintic interpolation removes the visible square boundaries produced by
+    // cubic 2D value noise when clouds cover a large part of the sky.
+    let u = f * f * f * (f * (f * 6.0 - vec3<f32>(15.0)) + vec3<f32>(10.0));
+    let x00 = mix(hash31(i), hash31(i + vec3<f32>(1.0, 0.0, 0.0)), u.x);
+    let x10 = mix(hash31(i + vec3<f32>(0.0, 1.0, 0.0)), hash31(i + vec3<f32>(1.0, 1.0, 0.0)), u.x);
+    let x01 = mix(hash31(i + vec3<f32>(0.0, 0.0, 1.0)), hash31(i + vec3<f32>(1.0, 0.0, 1.0)), u.x);
+    let x11 = mix(hash31(i + vec3<f32>(0.0, 1.0, 1.0)), hash31(i + vec3<f32>(1.0, 1.0, 1.0)), u.x);
+    return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
 }
 
-fn fbm2(p: vec2<f32>) -> f32 {
+fn fbm3(p: vec3<f32>) -> f32 {
     var q = p;
-    var amp = 0.52;
+    var amp = 0.54;
     var sum = 0.0;
     var norm = 0.0;
-    for (var i = 0; i < 4; i = i + 1) {
-        sum += noise2(q) * amp;
+    for (var i = 0; i < 3; i = i + 1) {
+        sum += noise3(q) * amp;
         norm += amp;
-        q = mat2x2<f32>(1.63, 1.12, -1.12, 1.63) * q + vec2<f32>(17.7, -9.2);
-        amp *= 0.50;
+        q = vec3<f32>(
+            q.y * 1.71 + q.z * 0.83,
+            q.z * 1.57 - q.x * 0.91,
+            q.x * 1.63 + q.y * 0.72
+        ) + vec3<f32>(11.7, -6.2, 4.8);
+        amp *= 0.47;
     }
     return sum / max(norm, 0.0001);
 }
@@ -66,32 +72,61 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> SkyOut {
     let pos = positions[vertex_index];
     var out: SkyOut;
     out.position = vec4<f32>(pos, 0.0, 1.0);
-    out.ray = camera_ray_from_ndc(pos);
+    out.ndc = pos;
     return out;
 }
 
 @fragment
 fn fs_main(in: SkyOut) -> @location(0) vec4<f32> {
-    let dir = normalize(in.ray);
-    let up = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
-    let horizon = vec3<f32>(0.30, 0.40, 0.42);
-    let mid = vec3<f32>(0.17, 0.29, 0.38);
-    let zenith = vec3<f32>(0.050, 0.110, 0.185);
-    var sky = mix(horizon, mid, smoothstep(0.04, 0.55, up));
-    sky = mix(sky, zenith, smoothstep(0.50, 1.0, up));
+    // Reconstruct after interpolation. Interpolating normalized corner rays
+    // makes the sky bend and slide incorrectly during camera rotation.
+    let dir = camera_ray_from_ndc(in.ndc);
+    // Zero elevation is the horizon. Mapping dir.y into 0.5 at the horizon
+    // caused the abrupt dark band in the previous gradient.
+    let elevation = clamp(max(dir.y, 0.0), 0.0, 1.0);
+    let horizon = vec3<f32>(0.52, 0.72, 0.89);
+    let mid = vec3<f32>(0.16, 0.50, 0.88);
+    let zenith = vec3<f32>(0.055, 0.27, 0.70);
+    var sky = mix(horizon, mid, smoothstep(0.0, 0.46, elevation));
+    sky = mix(sky, zenith, smoothstep(0.42, 1.0, elevation));
 
-    let cloud_uv = dir.xz / max(0.10 + dir.y * 0.80, 0.12) + vec2<f32>(frame.resolution_time_grid.z * 0.0020, -frame.resolution_time_grid.z * 0.0008);
-    let cloud = smoothstep(0.50, 0.75, fbm2(cloud_uv * 0.72 + vec2<f32>(13.7, -4.2)));
-    let cloud_col = mix(vec3<f32>(0.24, 0.29, 0.30), vec3<f32>(0.62, 0.66, 0.64), up);
-    sky = mix(sky, cloud_col, cloud * 0.18);
+    // Layered direction-space FBM creates broad cumulus groups with smaller
+    // lobes. Keeping it in direction space avoids a seam and keeps the cloud
+    // field fixed while the camera rotates.
+    let cloud_time = frame.resolution_time_grid.z * 0.006;
+    let cloud_plane = dir.xz / max(dir.y + 0.20, 0.20);
+    let cloud_pos = vec3<f32>(
+        cloud_plane.x * 0.62 + cloud_time,
+        dir.y * 1.7 + 0.41,
+        cloud_plane.y * 0.62 - cloud_time * 0.58
+    );
+    let broad = fbm3(cloud_pos * 0.72 + vec3<f32>(2.3, -1.1, 5.7));
+    let warp = fbm3(cloud_pos * 1.42 + vec3<f32>(broad * 2.8, -broad * 1.7, broad * 2.1));
+    let detail = noise3(cloud_pos * 6.2 + vec3<f32>(-7.2, 3.4, 11.8));
+    let cloud_signal = broad * 0.62 + warp * 0.30 + detail * 0.08;
+    // Broad directional banks keep the lower threshold from turning the whole
+    // sky overcast. The FBM cuts irregular edges and smaller holes into them.
+    let bank_left = smoothstep(0.78, 0.95, dot(dir, normalize(vec3<f32>(-0.66, 0.30, -0.69))));
+    let bank_mid = smoothstep(0.81, 0.96, dot(dir, normalize(vec3<f32>(0.02, 0.29, -0.96))));
+    let bank_right = smoothstep(0.80, 0.95, dot(dir, normalize(vec3<f32>(0.67, 0.25, -0.70))));
+    let cloud_bank = clamp(max(bank_left, max(bank_mid, bank_right)), 0.0, 1.0);
+    let cloud_visibility = smoothstep(0.018, 0.10, elevation) * (1.0 - smoothstep(0.80, 1.0, elevation));
+    let cloud_base = smoothstep(0.390, 0.555, cloud_signal) * cloud_bank * cloud_visibility;
+    let cloud_core = smoothstep(0.505, 0.655, cloud_signal) * cloud_bank * cloud_visibility;
+    let cloud_edge = max(cloud_base - cloud_core, 0.0);
+    let cloud_light = mix(vec3<f32>(0.62, 0.68, 0.74), vec3<f32>(0.98, 0.965, 0.93), cloud_core);
+    sky *= 1.0 - cloud_edge * 0.18;
+    sky = mix(sky, cloud_light, cloud_base * (0.66 + cloud_core * 0.26));
+
+    let horizon_haze = exp(-elevation * 13.0);
+    sky = mix(sky, vec3<f32>(0.68, 0.79, 0.86), horizon_haze * 0.42);
 
     let sun_dir = normalize(vec3<f32>(-0.36, 0.78, -0.50));
-    let sun_core = pow(max(dot(dir, sun_dir), 0.0), 420.0) * 1.25;
-    let sun_halo = pow(max(dot(dir, sun_dir), 0.0), 24.0) * 0.16;
+    let sun_core = pow(max(dot(dir, sun_dir), 0.0), 520.0) * 1.35;
+    let sun_halo = pow(max(dot(dir, sun_dir), 0.0), 18.0) * 0.10;
     sky += vec3<f32>(1.0, 0.82, 0.55) * (sun_core + sun_halo);
 
-    // Subtle atmosphere near the horizon; do not make it white, because the
-    // ocean will reflect this and lose contrast.
-    sky = mix(sky, horizon, (1.0 - up) * 0.12);
+    sky = sky / (sky + vec3<f32>(0.62, 0.52, 0.42));
+    sky = pow(max(sky, vec3<f32>(0.0)), vec3<f32>(1.0 / 1.28));
     return vec4<f32>(sky, 1.0);
 }

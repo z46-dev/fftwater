@@ -7,26 +7,39 @@ fn hash21(p: vec2<f32>) -> f32 {
     return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453123);
 }
 
-fn smooth_noise(p: vec2<f32>) -> f32 {
+fn wrap_cell(v: i32, period: i32) -> i32 {
+    return ((v % period) + period) % period;
+}
+
+fn periodic_noise(uv: vec2<f32>, cells_in: vec2<i32>, phase: vec2<f32>) -> f32 {
+    let cells = max(cells_in, vec2<i32>(1, 1));
+    let p = (uv + phase) * vec2<f32>(cells);
     let i = floor(p);
     let f = fract(p);
     let u = f * f * (vec2<f32>(3.0, 3.0) - 2.0 * f);
-    let a = hash21(i + vec2<f32>(0.0, 0.0));
-    let b = hash21(i + vec2<f32>(1.0, 0.0));
-    let c = hash21(i + vec2<f32>(0.0, 1.0));
-    let d = hash21(i + vec2<f32>(1.0, 1.0));
+
+    let i0 = vec2<i32>(i);
+    let x0 = wrap_cell(i0.x, cells.x);
+    let y0 = wrap_cell(i0.y, cells.y);
+    let x1 = wrap_cell(i0.x + 1, cells.x);
+    let y1 = wrap_cell(i0.y + 1, cells.y);
+
+    let a = hash21(vec2<f32>(f32(x0), f32(y0)));
+    let b = hash21(vec2<f32>(f32(x1), f32(y0)));
+    let c = hash21(vec2<f32>(f32(x0), f32(y1)));
+    let d = hash21(vec2<f32>(f32(x1), f32(y1)));
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
-fn fbm(p: vec2<f32>) -> f32 {
-    var q = p;
+fn periodic_fbm(uv: vec2<f32>, base_cells: vec2<i32>, phase: vec2<f32>) -> f32 {
+    var cells = max(base_cells, vec2<i32>(1, 1));
     var amp = 0.54;
     var sum = 0.0;
     var norm = 0.0;
     for (var i = 0; i < 5; i = i + 1) {
-        sum += smooth_noise(q) * amp;
+        sum += periodic_noise(uv, cells, phase + vec2<f32>(f32(i) * 0.173, -f32(i) * 0.119)) * amp;
         norm += amp;
-        q = mat2x2<f32>(1.74, 1.09, -1.09, 1.74) * q + vec2<f32>(21.7, -13.4);
+        cells *= 2;
         amp *= 0.50;
     }
     return sum / max(norm, 0.0001);
@@ -47,24 +60,28 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let uv = (vec2<f32>(id.xy) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
-    let p = uv * 256.0;
+    // Integer transforms preserve periodicity across both texture boundaries.
+    // The previous arbitrary FBM transform did not, so wrapping the generated
+    // texture created visible horizontal/vertical cross seams.
+    let broad_uv = mat2x2<f32>(1.0, 1.0, -1.0, 2.0) * uv;
+    let wind_uv = mat2x2<f32>(2.0, 1.0, -1.0, 1.0) * uv;
+    let lace_uv = mat2x2<f32>(3.0, 1.0, -2.0, 1.0) * uv;
 
     // R: broad space-variation/wave-weight mask.
-    let large = fbm(p * 0.030 + vec2<f32>(17.0, 31.0)) * 0.72
+    let large = periodic_fbm(broad_uv, vec2<i32>(4, 3), vec2<f32>(0.17, 0.31)) * 0.72
               + periodic_wave_noise(uv, vec2<f32>(4.0, 3.0), 0.17) * 0.28;
 
     // G: mid/short wave roughness regions, stretched along the dominant wind.
-    let wind_uv = vec2<f32>(uv.x * 0.78 + uv.y * 0.18, -uv.x * 0.24 + uv.y * 1.34);
-    let rough = fbm(wind_uv * 18.0 + vec2<f32>(-9.0, 44.0)) * 0.62
+    let rough = periodic_fbm(wind_uv, vec2<i32>(9, 13), vec2<f32>(-0.09, 0.44)) * 0.62
               + periodic_wave_noise(wind_uv, vec2<f32>(9.0, 13.0), 0.43) * 0.38;
 
     // B: low-frequency foam breakup. Broad soft patches only.
-    let foam_low = smoothstep(0.42, 0.88, fbm(p * 0.055 + vec2<f32>(73.0, -22.0)));
+    let foam_low = smoothstep(0.42, 0.88, periodic_fbm(broad_uv, vec2<i32>(7, 5), vec2<f32>(0.73, -0.22)));
 
     // A: high-frequency foam lace/detail. Keep it sparse so it gates foam rather
     // than painting bright noise everywhere.
-    let lace_base = fbm(p * 0.310 + vec2<f32>(-31.0, 5.0));
-    let lace_lines = periodic_wave_noise(wind_uv, vec2<f32>(34.0, 21.0), 0.61);
+    let lace_base = periodic_fbm(lace_uv, vec2<i32>(21, 17), vec2<f32>(-0.31, 0.05));
+    let lace_lines = periodic_wave_noise(lace_uv, vec2<f32>(34.0, 21.0), 0.61);
     let foam_high = smoothstep(0.58, 0.93, lace_base * 0.62 + lace_lines * 0.38);
 
     textureStore(variation_out, vec2<i32>(id.xy), vec4<f32>(

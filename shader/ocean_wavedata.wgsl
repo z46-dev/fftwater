@@ -95,7 +95,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ddx_dz = (u.x - d.x) / (2.0 * dx);
     let ddz_dx = (r.z - l.z) / (2.0 * dx);
     let jacobian = (1.0 + ddx_dx) * (1.0 + ddz_dz) - ddx_dz * ddz_dx;
-    let compression = saturate((1.0 - jacobian) * 2.45);
+    let compression = saturate((1.0 - jacobian) * 3.20);
 
     let axial_foam = (l.w + r.w + d.w + u.w) * 0.25;
     let diagonal_foam = (dl.w + dr.w + ul.w + ur.w) * 0.25;
@@ -103,15 +103,15 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let slope_mag = length(grad);
     let bend = length(vec2<f32>(r.y - 2.0 * c.y + l.y, u.y - 2.0 * c.y + d.y)) / max(dx * dx, 0.0001);
-    let curvature_break = smoothstep(0.00018, 0.0022, -lap);
-    let slope_break = smoothstep(0.0028, 0.024, slope_mag);
-    let compression_break = smoothstep(0.006, 0.18, compression);
+    let curvature_break = smoothstep(0.00016, 0.0018, -lap);
+    let slope_break = smoothstep(0.0025, 0.021, slope_mag);
+    let compression_break = smoothstep(0.004, 0.14, compression);
     let crest_support = smoothstep(0.00022, 0.0045, abs(lap) + bend * 0.65) * slope_break;
 
     var foam = c.w * 0.50 + neighbor_support * 0.26;
-    foam += curvature_break * slope_break * 0.24;
-    foam += compression_break * 0.22;
-    foam = min(foam, neighbor_support * 1.78 + c.w * 0.66 + crest_support * 0.18 + 0.026);
+    foam += curvature_break * slope_break * 0.28;
+    foam += compression_break * (0.18 + curvature_break * 0.12);
+    foam = min(foam, neighbor_support * 1.68 + c.w * 0.62 + crest_support * 0.22 + 0.022);
     foam = saturate(foam);
 
     // Moment is not a true higher-order wave moment yet, but it is the right

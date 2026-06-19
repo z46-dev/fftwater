@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"path/filepath"
 
 	"github.com/gogpu/gputypes"
 	"github.com/gogpu/wgpu"
@@ -12,10 +13,10 @@ import (
 )
 
 const (
-	defaultShipModelPath   = "assets/models/Roosevelt.glb"
 	defaultShipWorldLength = float32(315.0)
 	defaultShipSink        = float32(8.5)
 	shipUniformSize        = uint64(256)
+	shipMaxTextureSize     = uint32(1024)
 )
 
 type shipMaterialGPU struct {
@@ -30,67 +31,92 @@ type shipDrawGPU struct {
 	material   int
 }
 
+type shipModelGPU struct {
+	path         string
+	vertexBuffer *wgpu.Buffer
+	indexBuffer  *wgpu.Buffer
+	materials    []shipMaterialGPU
+	draws        []shipDrawGPU
+	indexCount   uint32
+}
+
+// Ship is one configured model instance. GPU bindings are private renderer
+// state; callers configure the model path and world-space fields.
+type Ship struct {
+	Name        string
+	ModelPath   string
+	Position    Vec3
+	Heading     float32
+	Length      float32
+	Sink        float32
+	MotionScale float32
+
+	uniformBuffer    *wgpu.Buffer
+	uniformBindGroup *wgpu.BindGroup
+	model            int
+}
+
+func DefaultShips() []Ship {
+	return []Ship{
+		{Name: "Roosevelt", ModelPath: "assets/models/Roosevelt.glb", Position: Vec3{X: 0, Z: 30}, Heading: 0.0, Length: 315, Sink: 8.7, MotionScale: 0.72},
+		{Name: "Shinano", ModelPath: "assets/models/Shinano.glb", Position: Vec3{X: -300, Z: -185}, Heading: 0.10, Length: 266, Sink: 8.8, MotionScale: 0.68},
+		{Name: "Essex", ModelPath: "assets/models/Essex.glb", Position: Vec3{X: 310, Z: -245}, Heading: -0.12, Length: 266, Sink: 8.2, MotionScale: 0.70},
+	}
+}
+
 type ShipRenderer struct {
 	device *wgpu.Device
 	queue  *wgpu.Queue
 
-	shaderModule     *wgpu.ShaderModule
-	pipeline         *wgpu.RenderPipeline
-	pipelineLayout   *wgpu.PipelineLayout
-	uniformLayout    *wgpu.BindGroupLayout
-	materialLayout   *wgpu.BindGroupLayout
-	uniformBindGroup *wgpu.BindGroup
+	shaderModule   *wgpu.ShaderModule
+	pipeline       *wgpu.RenderPipeline
+	pipelineMSAA   *wgpu.RenderPipeline
+	pipelineLayout *wgpu.PipelineLayout
+	uniformLayout  *wgpu.BindGroupLayout
+	materialLayout *wgpu.BindGroupLayout
 
-	sampler       *wgpu.Sampler
-	uniformBuffer *wgpu.Buffer
-	vertexBuffer  *wgpu.Buffer
-	indexBuffer   *wgpu.Buffer
-
-	materials   []shipMaterialGPU
-	draws       []shipDrawGPU
-	indexCount  uint32
-	worldLength float32
+	sampler *wgpu.Sampler
+	models  []shipModelGPU
+	ships   []Ship
 }
 
-func NewShipRenderer(device *wgpu.Device, surfaceFormat wgpu.TextureFormat, path string) (*ShipRenderer, error) {
-	cpu, err := loadShipGLB(path)
-	if err != nil {
-		return nil, fmt.Errorf("load ship glb %q: %w", path, err)
+func NewShipRenderer(device *wgpu.Device, surfaceFormat wgpu.TextureFormat, ships []Ship) (*ShipRenderer, error) {
+	if len(ships) == 0 {
+		ships = DefaultShips()
 	}
-	r := &ShipRenderer{device: device, queue: device.Queue(), worldLength: defaultShipWorldLength}
-	if err := r.createResources(surfaceFormat, cpu); err != nil {
+	r := &ShipRenderer{device: device, queue: device.Queue(), ships: append([]Ship(nil), ships...)}
+	cpuModels := make([]*shipModelCPU, 0, len(r.ships))
+	modelByPath := make(map[string]int, len(r.ships))
+	for i := range r.ships {
+		ship := &r.ships[i]
+		if ship.ModelPath == "" {
+			ship.ModelPath = "assets/models/Roosevelt.glb"
+		}
+		modelIndex, ok := modelByPath[ship.ModelPath]
+		if !ok {
+			cpu, err := loadShipGLB(ship.ModelPath)
+			if err != nil {
+				return nil, fmt.Errorf("load ship %q model %q: %w", ship.Name, ship.ModelPath, err)
+			}
+			modelIndex = len(cpuModels)
+			modelByPath[ship.ModelPath] = modelIndex
+			cpuModels = append(cpuModels, cpu)
+		}
+		ship.model = modelIndex
+	}
+	if err := r.createResources(surfaceFormat, cpuModels); err != nil {
 		r.Release()
 		return nil, err
 	}
 	return r, nil
 }
 
-func (r *ShipRenderer) createResources(surfaceFormat wgpu.TextureFormat, cpu *shipModelCPU) error {
+func (r *ShipRenderer) createResources(surfaceFormat wgpu.TextureFormat, cpuModels []*shipModelCPU) error {
 	var err error
 	r.shaderModule, err = r.device.CreateShaderModule(&wgpu.ShaderModuleDescriptor{Label: "ship glb shader", WGSL: shader.ShipWGSL})
 	if err != nil {
 		return fmt.Errorf("create ship shader module: %w", err)
 	}
-
-	r.uniformBuffer, err = r.device.CreateBuffer(&wgpu.BufferDescriptor{Label: "ship uniforms", Size: shipUniformSize, Usage: wgpu.BufferUsageUniform | wgpu.BufferUsageCopyDst})
-	if err != nil {
-		return fmt.Errorf("create ship uniform buffer: %w", err)
-	}
-	r.vertexBuffer, err = r.device.CreateBuffer(&wgpu.BufferDescriptor{Label: "ship vertices", Size: uint64(len(cpu.Vertices) * 4), Usage: wgpu.BufferUsageVertex | wgpu.BufferUsageCopyDst})
-	if err != nil {
-		return fmt.Errorf("create ship vertex buffer: %w", err)
-	}
-	r.indexBuffer, err = r.device.CreateBuffer(&wgpu.BufferDescriptor{Label: "ship indices", Size: uint64(len(cpu.Indices) * 4), Usage: wgpu.BufferUsageIndex | wgpu.BufferUsageCopyDst})
-	if err != nil {
-		return fmt.Errorf("create ship index buffer: %w", err)
-	}
-	if err := r.queue.WriteBuffer(r.vertexBuffer, 0, util.Float32Bytes(cpu.Vertices...)); err != nil {
-		return fmt.Errorf("upload ship vertices: %w", err)
-	}
-	if err := r.queue.WriteBuffer(r.indexBuffer, 0, uint32SliceBytes(cpu.Indices)); err != nil {
-		return fmt.Errorf("upload ship indices: %w", err)
-	}
-	r.indexCount = uint32(len(cpu.Indices))
 
 	r.sampler, err = r.device.CreateSampler(&wgpu.SamplerDescriptor{Label: "ship base-color sampler", AddressModeU: gputypes.AddressModeRepeat, AddressModeV: gputypes.AddressModeRepeat, AddressModeW: gputypes.AddressModeRepeat, MagFilter: gputypes.FilterModeLinear, MinFilter: gputypes.FilterModeLinear, MipmapFilter: gputypes.FilterModeLinear, LodMinClamp: 0, LodMaxClamp: 12})
 	if err != nil {
@@ -112,56 +138,139 @@ func (r *ShipRenderer) createResources(surfaceFormat wgpu.TextureFormat, cpu *sh
 	if err != nil {
 		return fmt.Errorf("create ship pipeline layout: %w", err)
 	}
-	r.uniformBindGroup, err = r.device.CreateBindGroup(&wgpu.BindGroupDescriptor{Label: "ship uniform bind group", Layout: r.uniformLayout, Entries: []wgpu.BindGroupEntry{{Binding: 0, Buffer: r.uniformBuffer, Size: shipUniformSize}}})
-	if err != nil {
-		return fmt.Errorf("create ship uniform bind group: %w", err)
+	for i := range r.ships {
+		ship := &r.ships[i]
+		if ship.Length <= 0 {
+			ship.Length = defaultShipWorldLength
+		}
+		if ship.Sink <= 0 {
+			ship.Sink = defaultShipSink
+		}
+		if ship.MotionScale <= 0 {
+			ship.MotionScale = 1
+		}
+		label := fmt.Sprintf("ship %d %s uniforms", i, ship.Name)
+		ship.uniformBuffer, err = r.device.CreateBuffer(&wgpu.BufferDescriptor{Label: label, Size: shipUniformSize, Usage: wgpu.BufferUsageUniform | wgpu.BufferUsageCopyDst})
+		if err != nil {
+			return fmt.Errorf("create %s: %w", label, err)
+		}
+		ship.uniformBindGroup, err = r.device.CreateBindGroup(&wgpu.BindGroupDescriptor{Label: label + " bind group", Layout: r.uniformLayout, Entries: []wgpu.BindGroupEntry{{Binding: 0, Buffer: ship.uniformBuffer, Size: shipUniformSize}}})
+		if err != nil {
+			return fmt.Errorf("create %s bind group: %w", label, err)
+		}
 	}
 
-	r.materials = make([]shipMaterialGPU, len(cpu.Materials))
+	r.models = make([]shipModelGPU, len(cpuModels))
+	modelPaths := make([]string, len(cpuModels))
+	for i := range r.ships {
+		if r.ships[i].model >= 0 && r.ships[i].model < len(modelPaths) {
+			modelPaths[r.ships[i].model] = r.ships[i].ModelPath
+		}
+	}
+	for i, cpu := range cpuModels {
+		model, err := r.createModelResources(modelPaths[i], cpu)
+		if err != nil {
+			return err
+		}
+		r.models[i] = model
+	}
+
+	r.pipeline, err = r.createPipeline(surfaceFormat, 1)
+	if err != nil {
+		return err
+	}
+	r.pipelineMSAA, err = r.createPipeline(surfaceFormat, 4)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *ShipRenderer) createModelResources(path string, cpu *shipModelCPU) (shipModelGPU, error) {
+	if cpu == nil {
+		return shipModelGPU{}, fmt.Errorf("nil ship model for %q", path)
+	}
+	label := filepath.Base(path)
+	model := shipModelGPU{path: path, indexCount: uint32(len(cpu.Indices))}
+	var err error
+	model.vertexBuffer, err = r.device.CreateBuffer(&wgpu.BufferDescriptor{Label: label + " vertices", Size: uint64(len(cpu.Vertices) * 4), Usage: wgpu.BufferUsageVertex | wgpu.BufferUsageCopyDst})
+	if err != nil {
+		return shipModelGPU{}, fmt.Errorf("create %s vertex buffer: %w", label, err)
+	}
+	model.indexBuffer, err = r.device.CreateBuffer(&wgpu.BufferDescriptor{Label: label + " indices", Size: uint64(len(cpu.Indices) * 4), Usage: wgpu.BufferUsageIndex | wgpu.BufferUsageCopyDst})
+	if err != nil {
+		model.release()
+		return shipModelGPU{}, fmt.Errorf("create %s index buffer: %w", label, err)
+	}
+	if err = r.queue.WriteBuffer(model.vertexBuffer, 0, util.Float32Bytes(cpu.Vertices...)); err != nil {
+		model.release()
+		return shipModelGPU{}, fmt.Errorf("upload %s vertices: %w", label, err)
+	}
+	if err = r.queue.WriteBuffer(model.indexBuffer, 0, uint32SliceBytes(cpu.Indices)); err != nil {
+		model.release()
+		return shipModelGPU{}, fmt.Errorf("upload %s indices: %w", label, err)
+	}
+
 	fallback := shipImageCPU{RGBA: []byte{145, 148, 142, 255}, Width: 1, Height: 1}
+	model.materials = make([]shipMaterialGPU, len(cpu.Materials))
 	for i, mat := range cpu.Materials {
 		img := fallback
 		if mat.Image >= 0 && mat.Image < len(cpu.Images) && len(cpu.Images[mat.Image].RGBA) > 0 {
 			img = cpu.Images[mat.Image]
 		}
-		gpuMat, err := r.createMaterialTexture(fmt.Sprintf("ship material %d %s", i, mat.Name), img)
+		model.materials[i], err = r.createMaterialTexture(fmt.Sprintf("%s material %d %s", label, i, mat.Name), img)
 		if err != nil {
-			return err
+			model.release()
+			return shipModelGPU{}, err
 		}
-		r.materials[i] = gpuMat
 	}
-	if len(r.materials) == 0 {
-		gpuMat, err := r.createMaterialTexture("ship fallback material", fallback)
-		if err != nil {
-			return err
+	if len(model.materials) == 0 {
+		gpuMat, createErr := r.createMaterialTexture(label+" fallback material", fallback)
+		if createErr != nil {
+			model.release()
+			return shipModelGPU{}, createErr
 		}
-		r.materials = []shipMaterialGPU{gpuMat}
+		model.materials = []shipMaterialGPU{gpuMat}
 	}
-	r.draws = make([]shipDrawGPU, len(cpu.Draws))
+	model.draws = make([]shipDrawGPU, len(cpu.Draws))
 	for i, d := range cpu.Draws {
 		mat := d.Material
-		if mat < 0 || mat >= len(r.materials) {
+		if mat < 0 || mat >= len(model.materials) {
 			mat = 0
 		}
-		r.draws[i] = shipDrawGPU{firstIndex: d.FirstIndex, indexCount: d.IndexCount, material: mat}
+		model.draws[i] = shipDrawGPU{firstIndex: d.FirstIndex, indexCount: d.IndexCount, material: mat}
 	}
+	return model, nil
+}
 
-	r.pipeline, err = r.device.CreateRenderPipeline(&wgpu.RenderPipelineDescriptor{
-		Label: "ship glb render pipeline", Layout: r.pipelineLayout,
+func (r *ShipRenderer) createPipeline(surfaceFormat wgpu.TextureFormat, sampleCount uint32) (*wgpu.RenderPipeline, error) {
+	var blend *gputypes.BlendState
+	alphaToCoverage := sampleCount > 1
+	if !alphaToCoverage {
+		// The 1x pipeline uses the shader's analytic waterline coverage directly.
+		// The 4x pipeline instead converts that alpha to a multisample mask.
+		b := gputypes.BlendStateAlpha()
+		blend = &b
+	}
+	pipeline, err := r.device.CreateRenderPipeline(&wgpu.RenderPipelineDescriptor{
+		Label: fmt.Sprintf("ship glb render pipeline %dx", sampleCount), Layout: r.pipelineLayout,
 		Vertex:       wgpu.VertexState{Module: r.shaderModule, EntryPoint: "vs_main", Buffers: []gputypes.VertexBufferLayout{{ArrayStride: 32, StepMode: gputypes.VertexStepModeVertex, Attributes: []gputypes.VertexAttribute{{Format: gputypes.VertexFormatFloat32x3, Offset: 0, ShaderLocation: 0}, {Format: gputypes.VertexFormatFloat32x3, Offset: 12, ShaderLocation: 1}, {Format: gputypes.VertexFormatFloat32x2, Offset: 24, ShaderLocation: 2}}}}},
-		Primitive:    wgpu.PrimitiveState{Topology: gputypes.PrimitiveTopologyTriangleList, FrontFace: gputypes.FrontFaceCCW, CullMode: gputypes.CullModeNone},
+		Primitive:    wgpu.PrimitiveState{Topology: gputypes.PrimitiveTopologyTriangleList, FrontFace: gputypes.FrontFaceCCW, CullMode: gputypes.CullModeBack},
 		DepthStencil: &wgpu.DepthStencilState{Format: gputypes.TextureFormatDepth32Float, DepthWriteEnabled: true, DepthCompare: gputypes.CompareFunctionLess},
-		Multisample:  gputypes.DefaultMultisampleState(),
-		Fragment:     &wgpu.FragmentState{Module: r.shaderModule, EntryPoint: "fs_main", Targets: []wgpu.ColorTargetState{{Format: surfaceFormat, WriteMask: gputypes.ColorWriteMaskAll}}},
+		Multisample:  gputypes.MultisampleState{Count: sampleCount, Mask: 0xFFFFFFFF, AlphaToCoverageEnabled: alphaToCoverage},
+		Fragment:     &wgpu.FragmentState{Module: r.shaderModule, EntryPoint: "fs_main", Targets: []wgpu.ColorTargetState{{Format: surfaceFormat, Blend: blend, WriteMask: gputypes.ColorWriteMaskAll}}},
 	})
 	if err != nil {
-		return fmt.Errorf("create ship pipeline: %w", err)
+		return nil, fmt.Errorf("create ship %dx pipeline: %w", sampleCount, err)
 	}
-	return nil
+	return pipeline, nil
 }
 
 func (r *ShipRenderer) createMaterialTexture(label string, img shipImageCPU) (shipMaterialGPU, error) {
 	mips := buildShipMipChain(img)
+	for len(mips) > 1 && (mips[0].Width > shipMaxTextureSize || mips[0].Height > shipMaxTextureSize) {
+		mips = mips[1:]
+	}
 	mipCount := uint32(len(mips))
 	if mipCount == 0 {
 		mips = []shipImageCPU{{RGBA: []byte{145, 148, 142, 255}, Width: 1, Height: 1}}
@@ -245,36 +354,53 @@ func buildShipMipChain(img shipImageCPU) []shipImageCPU {
 	return mips
 }
 
-func (r *ShipRenderer) Draw(pass *wgpu.RenderPassEncoder, frame WaterFrame) {
-	if r == nil || pass == nil || r.pipeline == nil || r.indexCount == 0 {
+func (r *ShipRenderer) Draw(pass *wgpu.RenderPassEncoder, frame WaterFrame, multisampled bool) {
+	if r == nil || pass == nil || r.pipeline == nil || len(r.models) == 0 || len(r.ships) == 0 {
 		return
 	}
-	_ = r.queue.WriteBuffer(r.uniformBuffer, 0, r.uniformBytes(frame))
-	pass.SetPipeline(r.pipeline)
-	pass.SetBindGroup(0, r.uniformBindGroup, nil)
-	pass.SetVertexBuffer(0, r.vertexBuffer, 0)
-	pass.SetIndexBuffer(r.indexBuffer, gputypes.IndexFormatUint32, 0)
-	for _, d := range r.draws {
-		if d.indexCount == 0 {
+	pipeline := r.pipeline
+	if multisampled {
+		pipeline = r.pipelineMSAA
+	}
+	pass.SetPipeline(pipeline)
+	for i := range r.ships {
+		ship := &r.ships[i]
+		if ship.uniformBuffer == nil || ship.uniformBindGroup == nil || ship.model < 0 || ship.model >= len(r.models) {
 			continue
 		}
-		mat := d.material
-		if mat < 0 || mat >= len(r.materials) {
-			mat = 0
+		model := &r.models[ship.model]
+		if model.vertexBuffer == nil || model.indexBuffer == nil || model.indexCount == 0 {
+			continue
 		}
-		pass.SetBindGroup(1, r.materials[mat].bind, nil)
-		pass.DrawIndexed(d.indexCount, 1, d.firstIndex, 0, 0)
+		if err := r.queue.WriteBuffer(ship.uniformBuffer, 0, r.uniformBytes(frame, *ship)); err != nil {
+			continue
+		}
+		pass.SetVertexBuffer(0, model.vertexBuffer, 0)
+		pass.SetIndexBuffer(model.indexBuffer, gputypes.IndexFormatUint32, 0)
+		pass.SetBindGroup(0, ship.uniformBindGroup, nil)
+		for _, d := range model.draws {
+			if d.indexCount == 0 {
+				continue
+			}
+			mat := d.material
+			if mat < 0 || mat >= len(model.materials) {
+				mat = 0
+			}
+			pass.SetBindGroup(1, model.materials[mat].bind, nil)
+			pass.DrawIndexed(d.indexCount, 1, d.firstIndex, 0, 0)
+		}
 	}
 }
 
-func (r *ShipRenderer) uniformBytes(frame WaterFrame) []byte {
-	model, normal := shipModelMatrices(frame.Time, r.worldLength)
+func (r *ShipRenderer) uniformBytes(frame WaterFrame, ship Ship) []byte {
+	model, normal := shipModelMatrices(frame.Time, ship)
+	waterline := ship.Position.Y + sampleShipWater(ship.Position.X, ship.Position.Z, frame.Time)*ship.MotionScale - 0.90
 	light := glbNormalize3([3]float32{-0.36, -0.78, -0.50})
 	vals := make([]float32, 0, int(shipUniformSize/4))
 	vals = append(vals, frame.ViewProj[:]...)
 	vals = append(vals, model[:]...)
 	vals = append(vals, normal[:]...)
-	vals = append(vals, frame.CameraPosition.X, frame.CameraPosition.Y, frame.CameraPosition.Z, 0)
+	vals = append(vals, frame.CameraPosition.X, frame.CameraPosition.Y, frame.CameraPosition.Z, waterline)
 	vals = append(vals, light[0], light[1], light[2], 0)
 	for len(vals) < int(shipUniformSize/4) {
 		vals = append(vals, 0)
@@ -282,18 +408,22 @@ func (r *ShipRenderer) uniformBytes(frame WaterFrame) []byte {
 	return util.Float32Bytes(vals...)
 }
 
-func shipModelMatrices(t, length float32) (mat4f, mat4f) {
-	x, z := float32(0), float32(0)
-	bow := sampleShipWater(x, z+length*0.28, t)
-	stern := sampleShipWater(x, z-length*0.28, t)
-	port := sampleShipWater(x-length*0.055, z, t)
-	star := sampleShipWater(x+length*0.055, z, t)
+func shipModelMatrices(t float32, ship Ship) (mat4f, mat4f) {
+	x, z := ship.Position.X, ship.Position.Z
+	length := ship.Length
+	forwardX := float32(math.Sin(float64(ship.Heading)))
+	forwardZ := float32(math.Cos(float64(ship.Heading)))
+	rightX := forwardZ
+	rightZ := -forwardX
+	bow := sampleShipWater(x+forwardX*length*0.28, z+forwardZ*length*0.28, t)
+	stern := sampleShipWater(x-forwardX*length*0.28, z-forwardZ*length*0.28, t)
+	port := sampleShipWater(x-rightX*length*0.055, z-rightZ*length*0.055, t)
+	star := sampleShipWater(x+rightX*length*0.055, z+rightZ*length*0.055, t)
 	center := sampleShipWater(x, z, t)
-	pitch := clamp32((bow-stern)/(length*0.56), -0.075, 0.075)
-	roll := clamp32((star-port)/(length*0.11), -0.085, 0.085)
-	yaw := float32(0)
-	sink := defaultShipSink
-	translation := [3]float32{x, center - sink, z}
+	pitch := clamp32((bow-stern)/(length*0.56)*ship.MotionScale, -0.075, 0.075)
+	roll := clamp32((star-port)/(length*0.11)*ship.MotionScale, -0.085, 0.085)
+	yaw := ship.Heading
+	translation := [3]float32{x, ship.Position.Y + center*ship.MotionScale - ship.Sink, z}
 	return composeShipMatrix(translation, length, yaw, pitch, roll), composeShipNormalMatrix(yaw, pitch, roll)
 }
 
@@ -333,6 +463,37 @@ func uint32SliceBytes(v []uint32) []byte {
 	return b
 }
 
+func (m *shipModelGPU) release() {
+	if m == nil {
+		return
+	}
+	if m.vertexBuffer != nil {
+		m.vertexBuffer.Release()
+		m.vertexBuffer = nil
+	}
+	if m.indexBuffer != nil {
+		m.indexBuffer.Release()
+		m.indexBuffer = nil
+	}
+	for i := range m.materials {
+		if m.materials[i].bind != nil {
+			m.materials[i].bind.Release()
+			m.materials[i].bind = nil
+		}
+		if m.materials[i].view != nil {
+			m.materials[i].view.Release()
+			m.materials[i].view = nil
+		}
+		if m.materials[i].texture != nil {
+			m.materials[i].texture.Release()
+			m.materials[i].texture = nil
+		}
+	}
+	m.materials = nil
+	m.draws = nil
+	m.indexCount = 0
+}
+
 func (r *ShipRenderer) Release() {
 	if r == nil {
 		return
@@ -341,13 +502,23 @@ func (r *ShipRenderer) Release() {
 		r.pipeline.Release()
 		r.pipeline = nil
 	}
+	if r.pipelineMSAA != nil {
+		r.pipelineMSAA.Release()
+		r.pipelineMSAA = nil
+	}
 	if r.pipelineLayout != nil {
 		r.pipelineLayout.Release()
 		r.pipelineLayout = nil
 	}
-	if r.uniformBindGroup != nil {
-		r.uniformBindGroup.Release()
-		r.uniformBindGroup = nil
+	for i := range r.ships {
+		if r.ships[i].uniformBindGroup != nil {
+			r.ships[i].uniformBindGroup.Release()
+			r.ships[i].uniformBindGroup = nil
+		}
+		if r.ships[i].uniformBuffer != nil {
+			r.ships[i].uniformBuffer.Release()
+			r.ships[i].uniformBuffer = nil
+		}
 	}
 	if r.uniformLayout != nil {
 		r.uniformLayout.Release()
@@ -357,32 +528,10 @@ func (r *ShipRenderer) Release() {
 		r.materialLayout.Release()
 		r.materialLayout = nil
 	}
-	if r.vertexBuffer != nil {
-		r.vertexBuffer.Release()
-		r.vertexBuffer = nil
+	for i := range r.models {
+		r.models[i].release()
 	}
-	if r.indexBuffer != nil {
-		r.indexBuffer.Release()
-		r.indexBuffer = nil
-	}
-	if r.uniformBuffer != nil {
-		r.uniformBuffer.Release()
-		r.uniformBuffer = nil
-	}
-	for i := range r.materials {
-		if r.materials[i].bind != nil {
-			r.materials[i].bind.Release()
-			r.materials[i].bind = nil
-		}
-		if r.materials[i].view != nil {
-			r.materials[i].view.Release()
-			r.materials[i].view = nil
-		}
-		if r.materials[i].texture != nil {
-			r.materials[i].texture.Release()
-			r.materials[i].texture = nil
-		}
-	}
+	r.models = nil
 	if r.sampler != nil {
 		r.sampler.Release()
 		r.sampler = nil

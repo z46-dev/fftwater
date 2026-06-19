@@ -334,7 +334,16 @@ func (m *shipModelCPU) appendMesh(gltf *glbAsset, bin []byte, mesh glbMesh, worl
 				m.Indices = append(m.Indices, baseVertex+uint32(i))
 			}
 		}
-		m.Draws = append(m.Draws, shipDrawCPU{Material: mat, FirstIndex: first, IndexCount: uint32(len(m.Indices)) - first})
+		indexCount := uint32(len(m.Indices)) - first
+		if extractedWoWSFixHandednessX {
+			// Mirroring X changes triangle handedness. Restore CCW winding so
+			// the runtime can reject back faces instead of shading both sides of
+			// every high-detail carrier triangle.
+			for i := first; i+2 < first+indexCount; i += 3 {
+				m.Indices[i+1], m.Indices[i+2] = m.Indices[i+2], m.Indices[i+1]
+			}
+		}
+		m.Draws = append(m.Draws, shipDrawCPU{Material: mat, FirstIndex: first, IndexCount: indexCount})
 	}
 }
 

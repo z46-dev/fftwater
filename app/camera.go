@@ -75,9 +75,9 @@ type WaterCamera struct {
 
 func NewWaterCamera() *WaterCamera {
 	return &WaterCamera{
-		Position: Vec3{X: 0, Y: 18, Z: 48},
+		Position: Vec3{X: 0, Y: 75, Z: 580},
 		Yaw:      waterCameraDefaultYaw,
-		Pitch:    waterCameraDefaultPitch,
+		Pitch:    -0.19,
 		FOVY:     waterCameraDefaultFOV,
 		Near:     waterCameraDefaultNear,
 		Far:      waterCameraDefaultFar,

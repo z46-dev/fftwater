@@ -2,7 +2,12 @@ package app
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gogpu/gogpu"
@@ -89,7 +94,7 @@ func Run(log *golog.Logger) error {
 				WithContinuousRender(true).
 				WithPowerPreference(gogpu.PowerPreferenceHighPerformance).
 				WithVSync(false).
-				WithBackend(gogpu.BackendGo),
+				WithBackend(gogpu.BackendGo).WithFullscreen(),
 		)
 
 		start         time.Time = time.Now()
@@ -101,9 +106,15 @@ func Run(log *golog.Logger) error {
 		pointerSource gpucontext.PointerEventSource
 		scrollSource  interface{ OnScroll(func(float64, float64)) }
 		debugMode     int
-		debugKeyDown  bool
+		shipAA        bool = os.Getenv("FFTWATER_SHIP_AA") != ""
+		aaToggle      atomic.Bool
+		lastAAToggle  atomic.Int64
+		captureDir    string = os.Getenv("FFTWATER_CAPTURE_DIR")
+		captureIndex  int
+		logFPS        bool = os.Getenv("FFTWATER_LOG_FPS") != ""
 		ok            bool
 	)
+	applyCameraOverride(cam, os.Getenv("FFTWATER_CAMERA"))
 
 	if pointerSource, ok = gpuApp.EventSource().(gpucontext.PointerEventSource); ok {
 		pointerSource.OnPointer(func(ev gpucontext.PointerEvent) {
@@ -125,6 +136,20 @@ func Run(log *golog.Logger) error {
 		})
 	}
 
+	// Letter key codes are unreliable on some Wayland/XKB combinations. Text
+	// input preserves the user's actual "f" key and avoids the false toggles
+	// observed with raw key-code polling. The timestamp suppresses key repeat.
+	gpuApp.EventSource().OnTextInput(func(text string) {
+		if text != "f" && text != "F" {
+			return
+		}
+		now := time.Now().UnixNano()
+		previous := lastAAToggle.Load()
+		if now-previous >= int64(300*time.Millisecond) && lastAAToggle.CompareAndSwap(previous, now) {
+			aaToggle.Store(true)
+		}
+	})
+
 	gpuApp.OnUpdate(func(dt float64) {
 		var in = gpuApp.Input()
 
@@ -135,14 +160,18 @@ func Run(log *golog.Logger) error {
 		}
 
 		if in != nil {
-			if in.Keyboard().Pressed(input.KeyTab) {
-				if !debugKeyDown {
-					debugMode = (debugMode + 1) % debugModeCount
-					debugKeyDown = true
-				}
-			} else {
-				debugKeyDown = false
+			if in.Keyboard().JustPressed(input.KeyTab) {
+				debugMode = (debugMode + 1) % debugModeCount
 			}
+
+		}
+
+		if aaToggle.Swap(false) {
+			shipAA = !shipAA
+			if renderer != nil {
+				renderer.SetShipAA(shipAA)
+			}
+			log.Infof("4x ship AA: %t\n", shipAA)
 		}
 
 		var dx, dy float32
@@ -218,15 +247,28 @@ func Run(log *golog.Logger) error {
 			if renderer, err = NewWaterRenderer(provider.Device(), provider.SurfaceFormat()); err != nil {
 				log.Panicf("create water renderer: %v", err)
 			}
+			renderer.SetShipAA(shipAA)
 
-			log.Infof("GoGPU backend: %s", dc.Backend())
+			log.Infof("GoGPU backend: %s\n", dc.Backend())
 		}
 
 		renderer.SetDebugMode(debugMode)
 
-		if err = renderer.Draw(finalSurface, NewWaterFrame(surfaceW, surfaceH, float32(elapsed), aspect, cam)); err != nil {
+		frame := NewWaterFrame(surfaceW, surfaceH, float32(elapsed), aspect, cam)
+		if err = renderer.Draw(finalSurface, frame); err != nil {
 			log.Errorf("draw water: %v", err)
 			return
+		}
+
+		captureTimes := [...]float64{2.0, 4.0, 6.0}
+		if captureDir != "" && captureIndex < len(captureTimes) && elapsed >= captureTimes[captureIndex] {
+			path := filepath.Join(captureDir, fmt.Sprintf("fftwater-%02d.png", captureIndex+1))
+			if err = renderer.CapturePNG(path, frame); err != nil {
+				log.Errorf("capture screenshot: %v\n", err)
+			} else {
+				log.Infof("captured screenshot: %s\n", path)
+			}
+			captureIndex++
 		}
 
 		if !ensure2DContext(provider) {
@@ -251,7 +293,11 @@ func Run(log *golog.Logger) error {
 		ctx.FillText(fmt.Sprintf("FPS: %d", fps), hudX+12, hudY+28)
 		ctx.FillText("GPU: "+gpuName, hudX+12, hudY+52)
 		ctx.FillText(fmt.Sprintf("Cam: %.1f %.1f %.1f", cam.Position.X, cam.Position.Y, cam.Position.Z), hudX+12, hudY+76)
-		ctx.FillText(fmt.Sprintf("Time: %.2fs   Height: %.2f   View: %s", elapsed, renderer.WaveHeightScale(), debugModeLabel(debugMode)), hudX+12, hudY+100)
+		aaLabel := "off"
+		if renderer.ShipAAEnabled() {
+			aaLabel = "4x"
+		}
+		ctx.FillText(fmt.Sprintf("Time: %.2fs   Height: %.2f   View: %s   Ship AA [F]: %s", elapsed, renderer.WaveHeightScale(), debugModeLabel(debugMode), aaLabel), hudX+12, hudY+100)
 
 		if err = ctx.Flush(finalSurface, nil); err != nil {
 			log.Errorf("flush 2D HUD overlay: %v", err)
@@ -263,6 +309,9 @@ func Run(log *golog.Logger) error {
 			lastSecond = time.Now()
 			fps = frameCount
 			frameCount = 0
+			if logFPS {
+				log.Infof("FPS: %d\n", fps)
+			}
 		}
 	})
 
@@ -279,4 +328,27 @@ func Run(log *golog.Logger) error {
 	})
 
 	return gpuApp.Run()
+}
+
+// applyCameraOverride accepts "x,y,z,yaw,pitch" for deterministic visual
+// regression captures without changing the normal startup camera.
+func applyCameraOverride(cam *WaterCamera, value string) {
+	if cam == nil || value == "" {
+		return
+	}
+	parts := strings.Split(value, ",")
+	if len(parts) != 5 {
+		return
+	}
+	values := [5]float32{}
+	for i, part := range parts {
+		v, err := strconv.ParseFloat(strings.TrimSpace(part), 32)
+		if err != nil {
+			return
+		}
+		values[i] = float32(v)
+	}
+	cam.Position = Vec3{X: values[0], Y: values[1], Z: values[2]}
+	cam.Yaw = values[3]
+	cam.Pitch = clamp32(values[4], waterCameraMinPitch, waterCameraMaxPitch)
 }

@@ -157,10 +157,10 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let high = noise2(world * 0.060 + vec2<f32>(-t * 0.120, t * 0.073));
     let lace = smoothstep(0.22, 0.86, low * 0.58 + high * 0.42);
 
-    let born = saturate(seed_foam * 0.70 + neighbor_foam * 0.22 + crest_agreement * 0.28);
+    let born = saturate(seed_foam * 0.74 + neighbor_foam * 0.18 + crest_agreement * 0.32);
     let coverage_gate = saturate(moment * 1.65 + grad_mag * 1.05 + seed_foam * 0.82);
-    var foam = prev.x * 0.978 + born * (0.042 + 0.090 * lace);
-    foam = min(foam, coverage_gate * 0.76 + born * 0.34 + 0.020);
+    var foam = prev.x * 0.972 + born * (0.035 + 0.078 * lace);
+    foam = min(foam, coverage_gate * 0.70 + born * 0.32 + 0.016);
     foam = saturate(foam);
 
     var roughness = max(prev.y * 0.986, moment * 1.12 + crest_agreement * 0.32 + foam * 0.26);
@@ -169,7 +169,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var crest_memory = max(prev.z * 0.974, crest_agreement * 1.06 + seed_foam * 0.36);
     crest_memory = saturate(crest_memory);
 
-    var breakup = max(prev.w * 0.940, lace * born);
+    var breakup = max(prev.w * 0.925, lace * born);
     breakup = saturate(breakup);
 
     textureStore(foam_history_out, p, vec4<f32>(foam, roughness, crest_memory, breakup));

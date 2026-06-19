@@ -1,8 +1,14 @@
 package app
 
 import (
+	"context"
 	"fmt"
+	"image"
+	"image/png"
 	"math"
+	"os"
+	"path/filepath"
+	"time"
 
 	"github.com/gogpu/gputypes"
 	"github.com/gogpu/wgpu"
@@ -11,7 +17,7 @@ import (
 )
 
 const (
-	waterGridCells           uint32  = 240
+	waterGridCells           uint32  = 192
 	waterSpectrumTextureSize uint32  = 256
 	waterModeTextureSize     uint32  = 64
 	waterModeCascadeCount    uint32  = 4
@@ -20,12 +26,13 @@ const (
 	waterMaxDistance         float32 = 120000.0
 	waterGridSnap            float32 = 0.0
 	waterChopScale           float32 = 0.66
-	waterFoamGain            float32 = 0.50
+	waterFoamGain            float32 = 0.82
 	waterDetailGain          float32 = 1.44
+	waterMotionTimeScale     float32 = 0.80
 	// Height knob for quick tuning. This is packed into water_params1.y and
 	// intentionally scales coherent FFT body waves, not high-frequency
 	// capillary normal noise. Raise/lower this first when tuning sea state.
-	waterHeightScaleDefault float32            = 1.62
+	waterHeightScaleDefault float32            = 0.92
 	waterSpectrumWorldSize  float32            = 3072.0
 	shipDepthFormat         wgpu.TextureFormat = gputypes.TextureFormatDepth32Float
 )
@@ -80,7 +87,7 @@ func NewWaterFrame(width, height uint32, time, aspect float32, cam *WaterCamera)
 	return WaterFrame{
 		Width:              width,
 		Height:             height,
-		Time:               time,
+		Time:               time * waterMotionTimeScale,
 		Aspect:             aspect,
 		TanHalfFOVY:        cam.TanHalfFOVY(),
 		ViewProj:           cam.ViewProj(aspect),
@@ -103,6 +110,7 @@ type WaterRenderer struct {
 	surfaceFormat wgpu.TextureFormat
 	debugMode     int
 	heightScale   float32
+	shipAA        bool
 
 	shaderModule            *wgpu.ShaderModule
 	skyShaderModule         *wgpu.ShaderModule
@@ -120,6 +128,11 @@ type WaterRenderer struct {
 	shipDepthView    *wgpu.TextureView
 	shipDepthWidth   uint32
 	shipDepthHeight  uint32
+	shipDepthSamples uint32
+	msaaColorTexture *wgpu.Texture
+	msaaColorView    *wgpu.TextureView
+	msaaColorWidth   uint32
+	msaaColorHeight  uint32
 
 	uniformBuffer *wgpu.Buffer
 
@@ -210,7 +223,9 @@ type WaterRenderer struct {
 	variationBindGroup   *wgpu.BindGroup
 
 	renderPipeline                  *wgpu.RenderPipeline
+	renderPipelineMSAA              *wgpu.RenderPipeline
 	skyPipeline                     *wgpu.RenderPipeline
+	skyPipelineMSAA                 *wgpu.RenderPipeline
 	initPipeline                    *wgpu.ComputePipeline
 	evolvePipeline                  *wgpu.ComputePipeline
 	fftBitReverseHorizontalPipeline *wgpu.ComputePipeline
@@ -246,6 +261,16 @@ func (r *WaterRenderer) WaveHeightScale() float32 {
 		return waterHeightScaleDefault
 	}
 	return r.heightScale
+}
+
+func (r *WaterRenderer) SetShipAA(enabled bool) {
+	if r != nil {
+		r.shipAA = enabled
+	}
+}
+
+func (r *WaterRenderer) ShipAAEnabled() bool {
+	return r != nil && r.shipAA
 }
 
 func NewWaterRenderer(device *wgpu.Device, surfaceFormat wgpu.TextureFormat) (*WaterRenderer, error) {
@@ -957,7 +982,7 @@ func (r *WaterRenderer) createResources() error {
 		return fmt.Errorf("create water temporal foam history clear pipeline: %w", err)
 	}
 
-	r.shipRenderer, err = NewShipRenderer(r.device, r.surfaceFormat, defaultShipModelPath)
+	r.shipRenderer, err = NewShipRenderer(r.device, r.surfaceFormat, DefaultShips())
 	if err != nil {
 		return fmt.Errorf("create ship renderer: %w", err)
 	}
@@ -972,8 +997,30 @@ func (r *WaterRenderer) createResources() error {
 		return fmt.Errorf("create water variation pipeline: %w", err)
 	}
 
-	r.skyPipeline, err = r.device.CreateRenderPipeline(&wgpu.RenderPipelineDescriptor{
-		Label:  "procedural skybox pipeline",
+	r.skyPipeline, err = r.createSkyPipeline(1)
+	if err != nil {
+		return err
+	}
+	r.skyPipelineMSAA, err = r.createSkyPipeline(4)
+	if err != nil {
+		return err
+	}
+
+	r.renderPipeline, err = r.createWaterPipeline(1)
+	if err != nil {
+		return err
+	}
+	r.renderPipelineMSAA, err = r.createWaterPipeline(4)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *WaterRenderer) createSkyPipeline(sampleCount uint32) (*wgpu.RenderPipeline, error) {
+	pipeline, err := r.device.CreateRenderPipeline(&wgpu.RenderPipelineDescriptor{
+		Label:  fmt.Sprintf("procedural skybox pipeline %dx", sampleCount),
 		Layout: r.skyPipelineLayout,
 		Vertex: wgpu.VertexState{
 			Module:     r.skyShaderModule,
@@ -984,7 +1031,7 @@ func (r *WaterRenderer) createResources() error {
 			FrontFace: gputypes.FrontFaceCCW,
 			CullMode:  gputypes.CullModeNone,
 		},
-		Multisample: gputypes.DefaultMultisampleState(),
+		Multisample: gputypes.MultisampleState{Count: sampleCount, Mask: 0xFFFFFFFF},
 		Fragment: &wgpu.FragmentState{
 			Module:     r.skyShaderModule,
 			EntryPoint: "fs_main",
@@ -997,11 +1044,14 @@ func (r *WaterRenderer) createResources() error {
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("create skybox render pipeline: %w", err)
+		return nil, fmt.Errorf("create skybox %dx render pipeline: %w", sampleCount, err)
 	}
+	return pipeline, nil
+}
 
-	r.renderPipeline, err = r.device.CreateRenderPipeline(&wgpu.RenderPipelineDescriptor{
-		Label:  "water projected-grid pipeline",
+func (r *WaterRenderer) createWaterPipeline(sampleCount uint32) (*wgpu.RenderPipeline, error) {
+	pipeline, err := r.device.CreateRenderPipeline(&wgpu.RenderPipelineDescriptor{
+		Label:  fmt.Sprintf("water projected-grid pipeline %dx", sampleCount),
 		Layout: r.renderPipelineLayout,
 		Vertex: wgpu.VertexState{
 			Module:     r.shaderModule,
@@ -1012,7 +1062,7 @@ func (r *WaterRenderer) createResources() error {
 			FrontFace: gputypes.FrontFaceCCW,
 			CullMode:  gputypes.CullModeNone,
 		},
-		Multisample: gputypes.DefaultMultisampleState(),
+		Multisample: gputypes.MultisampleState{Count: sampleCount, Mask: 0xFFFFFFFF},
 		Fragment: &wgpu.FragmentState{
 			Module:     r.shaderModule,
 			EntryPoint: "fs_main",
@@ -1025,10 +1075,9 @@ func (r *WaterRenderer) createResources() error {
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("create water render pipeline: %w", err)
+		return nil, fmt.Errorf("create water %dx render pipeline: %w", sampleCount, err)
 	}
-
-	return nil
+	return pipeline, nil
 }
 
 func (r *WaterRenderer) createFFTBindGroup(label string, input, output *wgpu.TextureView) (*wgpu.BindGroup, error) {
@@ -1129,18 +1178,24 @@ func (r *WaterRenderer) dispatchFFTChain(encoder *wgpu.CommandEncoder, label str
 	return nil
 }
 
-func (r *WaterRenderer) ensureShipDepth(width, height uint32) error {
-	if r.shipDepthView != nil && r.shipDepthWidth == width && r.shipDepthHeight == height {
+func (r *WaterRenderer) ensureRenderTargets(width, height uint32) error {
+	samples := uint32(1)
+	if r.shipAA {
+		samples = 4
+	}
+	if r.shipDepthView != nil && r.shipDepthWidth == width && r.shipDepthHeight == height && r.shipDepthSamples == samples {
 		return nil
 	}
 	releaseTextureView(&r.shipDepthView)
 	releaseTexture(&r.shipDepthTexture)
+	releaseTextureView(&r.msaaColorView)
+	releaseTexture(&r.msaaColorTexture)
 
 	tex, err := r.device.CreateTexture(&wgpu.TextureDescriptor{
 		Label:         "ship depth texture",
 		Size:          wgpu.Extent3D{Width: width, Height: height, DepthOrArrayLayers: 1},
 		MipLevelCount: 1,
-		SampleCount:   1,
+		SampleCount:   samples,
 		Dimension:     wgpu.TextureDimension2D,
 		Format:        shipDepthFormat,
 		Usage:         wgpu.TextureUsageRenderAttachment,
@@ -1166,7 +1221,43 @@ func (r *WaterRenderer) ensureShipDepth(width, height uint32) error {
 	r.shipDepthView = view
 	r.shipDepthWidth = width
 	r.shipDepthHeight = height
+	r.shipDepthSamples = samples
+
+	if samples > 1 {
+		r.msaaColorTexture, err = r.device.CreateTexture(&wgpu.TextureDescriptor{
+			Label:         "water MSAA color texture",
+			Size:          wgpu.Extent3D{Width: width, Height: height, DepthOrArrayLayers: 1},
+			MipLevelCount: 1,
+			SampleCount:   samples,
+			Dimension:     wgpu.TextureDimension2D,
+			Format:        r.surfaceFormat,
+			Usage:         wgpu.TextureUsageRenderAttachment,
+		})
+		if err != nil {
+			return fmt.Errorf("create water MSAA color texture: %w", err)
+		}
+		r.msaaColorView, err = r.device.CreateTextureView(r.msaaColorTexture, nil)
+		if err != nil {
+			return fmt.Errorf("create water MSAA color view: %w", err)
+		}
+		r.msaaColorWidth = width
+		r.msaaColorHeight = height
+	}
 	return nil
+}
+
+func selectResolveTarget(enabled bool, target *wgpu.TextureView) *wgpu.TextureView {
+	if enabled {
+		return target
+	}
+	return nil
+}
+
+func selectStoreOp(multisampled bool) wgpu.StoreOp {
+	if multisampled {
+		return gputypes.StoreOpDiscard
+	}
+	return gputypes.StoreOpStore
 }
 
 func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
@@ -1183,7 +1274,7 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 	if frame.Width == 0 || frame.Height == 0 {
 		return nil
 	}
-	if err := r.ensureShipDepth(frame.Width, frame.Height); err != nil {
+	if err := r.ensureRenderTargets(frame.Width, frame.Height); err != nil {
 		return err
 	}
 
@@ -1279,21 +1370,24 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 		return err
 	}
 
+	colorTarget := target
+	skyPipeline := r.skyPipeline
+	waterPipeline := r.renderPipeline
+	if r.shipAA {
+		colorTarget = r.msaaColorView
+		skyPipeline = r.skyPipelineMSAA
+		waterPipeline = r.renderPipelineMSAA
+	}
+
 	pass, err := encoder.BeginRenderPass(&wgpu.RenderPassDescriptor{
 		Label: "water render pass",
 		ColorAttachments: []wgpu.RenderPassColorAttachment{
 			{
-				View:       target,
+				View:       colorTarget,
 				LoadOp:     gputypes.LoadOpClear,
 				StoreOp:    gputypes.StoreOpStore,
 				ClearValue: gputypes.Color{R: 0.11, G: 0.18, B: 0.22, A: 1.0},
 			},
-		},
-		DepthStencilAttachment: &wgpu.RenderPassDepthStencilAttachment{
-			View:            r.shipDepthView,
-			DepthLoadOp:     gputypes.LoadOpClear,
-			DepthStoreOp:    gputypes.StoreOpStore,
-			DepthClearValue: 1.0,
 		},
 	})
 	if err != nil {
@@ -1301,11 +1395,11 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 		return fmt.Errorf("begin water render pass: %w", err)
 	}
 
-	pass.SetPipeline(r.skyPipeline)
+	pass.SetPipeline(skyPipeline)
 	pass.SetBindGroup(0, r.skyBindGroup, nil)
 	pass.Draw(3, 1, 0, 0)
 
-	pass.SetPipeline(r.renderPipeline)
+	pass.SetPipeline(waterPipeline)
 	pass.SetBindGroup(0, renderBindGroup, nil)
 	pass.Draw(waterGridCells*waterGridCells*6, 1, 0, 0)
 
@@ -1319,9 +1413,10 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 			Label: "ship render pass",
 			ColorAttachments: []wgpu.RenderPassColorAttachment{
 				{
-					View:    target,
-					LoadOp:  gputypes.LoadOpLoad,
-					StoreOp: gputypes.StoreOpStore,
+					View:          colorTarget,
+					ResolveTarget: selectResolveTarget(r.shipAA, target),
+					LoadOp:        gputypes.LoadOpLoad,
+					StoreOp:       selectStoreOp(r.shipAA),
 				},
 			},
 			DepthStencilAttachment: &wgpu.RenderPassDepthStencilAttachment{
@@ -1335,7 +1430,7 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 			encoder.DiscardEncoding()
 			return fmt.Errorf("begin ship render pass: %w", err)
 		}
-		r.shipRenderer.Draw(shipPass, frame)
+		r.shipRenderer.Draw(shipPass, frame, r.shipAA)
 		if err = shipPass.End(); err != nil {
 			encoder.DiscardEncoding()
 			return fmt.Errorf("end ship render pass: %w", err)
@@ -1361,6 +1456,127 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 	r.foamHistoryInitialized = true
 	r.foamHistoryFlip = !r.foamHistoryFlip
 
+	return nil
+}
+
+// CapturePNG renders one additional frame into a CPU-readable texture. It is
+// intended for visual regression checks and is only called when explicitly
+// enabled by the app's FFTWATER_CAPTURE_DIR environment variable.
+func (r *WaterRenderer) CapturePNG(path string, frame WaterFrame) error {
+	if r == nil || r.device == nil || frame.Width == 0 || frame.Height == 0 {
+		return fmt.Errorf("cannot capture an uninitialized water frame")
+	}
+
+	texture, err := r.device.CreateTexture(&wgpu.TextureDescriptor{
+		Label: "water screenshot target",
+		Size: wgpu.Extent3D{
+			Width:              frame.Width,
+			Height:             frame.Height,
+			DepthOrArrayLayers: 1,
+		},
+		MipLevelCount: 1,
+		SampleCount:   1,
+		Dimension:     wgpu.TextureDimension2D,
+		Format:        r.surfaceFormat,
+		Usage:         wgpu.TextureUsageRenderAttachment | wgpu.TextureUsageCopySrc,
+	})
+	if err != nil {
+		return fmt.Errorf("create screenshot texture: %w", err)
+	}
+	defer texture.Release()
+
+	view, err := r.device.CreateTextureView(texture, nil)
+	if err != nil {
+		return fmt.Errorf("create screenshot view: %w", err)
+	}
+	defer view.Release()
+
+	if err = r.Draw(view, frame); err != nil {
+		return fmt.Errorf("draw screenshot frame: %w", err)
+	}
+
+	bytesPerRow := (frame.Width*4 + 255) &^ 255
+	bufferSize := uint64(bytesPerRow) * uint64(frame.Height)
+	staging, err := r.device.CreateBuffer(&wgpu.BufferDescriptor{
+		Label: "water screenshot readback",
+		Size:  bufferSize,
+		Usage: wgpu.BufferUsageCopyDst | wgpu.BufferUsageMapRead,
+	})
+	if err != nil {
+		return fmt.Errorf("create screenshot readback buffer: %w", err)
+	}
+	defer staging.Release()
+
+	encoder, err := r.device.CreateCommandEncoder(&wgpu.CommandEncoderDescriptor{Label: "water screenshot copy encoder"})
+	if err != nil {
+		return fmt.Errorf("create screenshot copy encoder: %w", err)
+	}
+	encoder.CopyTextureToBuffer(texture, staging, []wgpu.BufferTextureCopy{{
+		BufferLayout: wgpu.ImageDataLayout{
+			Offset:       0,
+			BytesPerRow:  bytesPerRow,
+			RowsPerImage: frame.Height,
+		},
+		TextureBase: wgpu.ImageCopyTexture{Texture: texture},
+		Size: wgpu.Extent3D{
+			Width:              frame.Width,
+			Height:             frame.Height,
+			DepthOrArrayLayers: 1,
+		},
+	}})
+	cmd, err := encoder.Finish()
+	if err != nil {
+		return fmt.Errorf("finish screenshot copy: %w", err)
+	}
+	if _, err = r.device.Queue().Submit(cmd); err != nil {
+		cmd.Release()
+		return fmt.Errorf("submit screenshot copy: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err = staging.Map(ctx, wgpu.MapModeRead, 0, bufferSize); err != nil {
+		return fmt.Errorf("map screenshot buffer: %w", err)
+	}
+	defer staging.Unmap()
+
+	mapped, err := staging.MappedRange(0, bufferSize)
+	if err != nil {
+		return fmt.Errorf("read screenshot buffer: %w", err)
+	}
+	defer mapped.Release()
+	src := mapped.Bytes()
+	img := image.NewRGBA(image.Rect(0, 0, int(frame.Width), int(frame.Height)))
+	isBGRA := r.surfaceFormat == gputypes.TextureFormatBGRA8Unorm ||
+		r.surfaceFormat == gputypes.TextureFormatBGRA8UnormSrgb
+	for y := uint32(0); y < frame.Height; y++ {
+		row := src[uint64(y)*uint64(bytesPerRow):]
+		dst := img.Pix[int(y)*img.Stride:]
+		for x := uint32(0); x < frame.Width; x++ {
+			si := x * 4
+			di := int(x * 4)
+			if isBGRA {
+				dst[di+0], dst[di+1], dst[di+2], dst[di+3] = row[si+2], row[si+1], row[si+0], row[si+3]
+			} else {
+				copy(dst[di:di+4], row[si:si+4])
+			}
+		}
+	}
+
+	if err = os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create screenshot directory: %w", err)
+	}
+	file, err := os.Create(filepath.Clean(path))
+	if err != nil {
+		return fmt.Errorf("create screenshot file: %w", err)
+	}
+	if err = png.Encode(file, img); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("encode screenshot: %w", err)
+	}
+	if err = file.Close(); err != nil {
+		return fmt.Errorf("close screenshot: %w", err)
+	}
 	return nil
 }
 
@@ -1456,8 +1672,12 @@ func (r *WaterRenderer) Release() {
 	}
 	releaseTextureView(&r.shipDepthView)
 	releaseTexture(&r.shipDepthTexture)
+	releaseTextureView(&r.msaaColorView)
+	releaseTexture(&r.msaaColorTexture)
 
+	releaseRenderPipeline(&r.renderPipelineMSAA)
 	releaseRenderPipeline(&r.renderPipeline)
+	releaseRenderPipeline(&r.skyPipelineMSAA)
 	releaseRenderPipeline(&r.skyPipeline)
 	releaseComputePipeline(&r.variationPipeline)
 	releaseComputePipeline(&r.foamHistoryClearPipeline)

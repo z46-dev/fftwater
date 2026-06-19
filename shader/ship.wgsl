@@ -41,6 +41,17 @@ fn vs_main(in: VertexIn) -> VertexOut {
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    // Analytically antialias the hull clipping plane. This works in the normal
+    // single-sample path, so a clean waterline does not require multisampling
+    // the entire fullscreen sky and ocean. In 4x mode the same alpha drives
+    // alpha-to-coverage for a sample-accurate edge.
+    let waterline_delta = in.world_pos.y - ship.camera_pos_pad.w;
+    let waterline_width = max(fwidth(waterline_delta) * 1.35, 0.035);
+    let waterline_coverage = smoothstep(-waterline_width, waterline_width, waterline_delta);
+    if (waterline_coverage <= 0.001) {
+        discard;
+    }
+
     let n = normalize(in.normal);
     let l = normalize(-ship.light_dir_pad.xyz);
     let v = normalize(ship.camera_pos_pad.xyz - in.world_pos);
@@ -50,8 +61,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let ndl = clamp(dot(n, l), 0.0, 1.0);
     let ndh = clamp(dot(n, h), 0.0, 1.0);
 
-    let ambient = vec3<f32>(0.18, 0.22, 0.24);
-    let diffuse = tex.rgb * (ambient + ndl * vec3<f32>(0.74, 0.76, 0.72));
+    let ambient = vec3<f32>(0.27, 0.30, 0.31);
+    let diffuse = tex.rgb * (ambient + ndl * vec3<f32>(0.70, 0.72, 0.69));
     let spec = pow(ndh, 58.0) * 0.12;
     let color = diffuse + vec3<f32>(0.95, 0.88, 0.72) * spec;
 
@@ -60,5 +71,5 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     if (tex.a < 0.08) {
         discard;
     }
-    return vec4<f32>(color, tex.a);
+    return vec4<f32>(color, tex.a * waterline_coverage);
 }
