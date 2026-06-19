@@ -17,6 +17,8 @@ const (
 	defaultShipSink        = float32(8.5)
 	shipUniformSize        = uint64(256)
 	shipMaxTextureSize     = uint32(1024)
+	fleetFullSpeed         = float32(15.5)
+	fleetTurnRate          = float32(0.018)
 )
 
 type shipMaterialGPU struct {
@@ -43,13 +45,22 @@ type shipModelGPU struct {
 // Ship is one configured model instance. GPU bindings are private renderer
 // state; callers configure the model path and world-space fields.
 type Ship struct {
-	Name        string
-	ModelPath   string
-	Position    Vec3
-	Heading     float32
-	Length      float32
-	Sink        float32
-	MotionScale float32
+	Name         string
+	ModelPath    string
+	Position     Vec3
+	Heading      float32
+	Length       float32
+	Sink         float32
+	MotionScale  float32
+	Speed        float32
+	Beam         float32
+	Draft        float32
+	WakeStrength float32
+	Propellers   float32
+	TurnRate     float32
+
+	initialPosition Vec3
+	initialHeading  float32
 
 	uniformBuffer    *wgpu.Buffer
 	uniformBindGroup *wgpu.BindGroup
@@ -58,9 +69,58 @@ type Ship struct {
 
 func DefaultShips() []Ship {
 	return []Ship{
-		{Name: "Roosevelt", ModelPath: "assets/models/Roosevelt.glb", Position: Vec3{X: 0, Z: 30}, Heading: 0.0, Length: 315, Sink: 8.7, MotionScale: 0.72},
-		{Name: "Shinano", ModelPath: "assets/models/Shinano.glb", Position: Vec3{X: -300, Z: -185}, Heading: 0.10, Length: 266, Sink: 8.8, MotionScale: 0.68},
-		{Name: "Essex", ModelPath: "assets/models/Essex.glb", Position: Vec3{X: 310, Z: -245}, Heading: -0.12, Length: 266, Sink: 8.2, MotionScale: 0.70},
+		{Name: "Roosevelt", ModelPath: "assets/models/Roosevelt.glb", Position: Vec3{X: 0, Z: 30}, Heading: 0.0, Length: 315, Sink: 8.7, MotionScale: 0.72, Speed: fleetFullSpeed, Beam: 40.0, Draft: 11.0, WakeStrength: 1.0, Propellers: 4},
+		{Name: "Shinano", ModelPath: "assets/models/Shinano.glb", Position: Vec3{X: -300, Z: -185}, Heading: -0.10, Length: 266, Sink: 8.8, MotionScale: 0.68, Speed: fleetFullSpeed / 3, Beam: 36.3, Draft: 10.3, WakeStrength: 0.92, Propellers: 4, TurnRate: -fleetTurnRate},
+		{Name: "Essex", ModelPath: "assets/models/Essex.glb", Position: Vec3{X: 310, Z: -245}, Heading: 0.12, Length: 266, Sink: 8.2, MotionScale: 0.70, Speed: fleetFullSpeed * 2 / 3, Beam: 28.3, Draft: 8.7, WakeStrength: 0.88, Propellers: 4, TurnRate: fleetTurnRate},
+	}
+}
+
+type ShipInteraction struct {
+	Position   Vec3
+	Forward    Vec3
+	Speed      float32
+	Strength   float32
+	Length     float32
+	Beam       float32
+	Draft      float32
+	Propellers float32
+	Phase      float32
+}
+
+func (r *ShipRenderer) Interactions() []ShipInteraction {
+	if r == nil {
+		return nil
+	}
+	out := make([]ShipInteraction, 0, len(r.ships))
+	for i, ship := range r.ships {
+		out = append(out, ShipInteraction{
+			Position: ship.Position,
+			Forward:  Vec3{X: float32(math.Sin(float64(ship.Heading))), Z: float32(math.Cos(float64(ship.Heading)))},
+			Speed:    ship.Speed, Strength: ship.WakeStrength, Length: ship.Length,
+			Beam: ship.Beam, Draft: ship.Draft, Propellers: ship.Propellers,
+			Phase: float32(i) * 1.93,
+		})
+	}
+	return out
+}
+
+func (r *ShipRenderer) UpdateMotion(t float32) {
+	if r == nil {
+		return
+	}
+	for i := range r.ships {
+		ship := &r.ships[i]
+		heading := ship.initialHeading + ship.TurnRate*t
+		if float32(math.Abs(float64(ship.TurnRate))) < 0.000001 {
+			ship.Position.X = ship.initialPosition.X + float32(math.Sin(float64(ship.initialHeading)))*ship.Speed*t
+			ship.Position.Z = ship.initialPosition.Z + float32(math.Cos(float64(ship.initialHeading)))*ship.Speed*t
+		} else {
+			radius := ship.Speed / ship.TurnRate
+			ship.Position.X = ship.initialPosition.X + radius*(float32(math.Cos(float64(ship.initialHeading)))-float32(math.Cos(float64(heading))))
+			ship.Position.Z = ship.initialPosition.Z + radius*(float32(math.Sin(float64(heading)))-float32(math.Sin(float64(ship.initialHeading))))
+		}
+		ship.Position.Y = ship.initialPosition.Y
+		ship.Heading = heading
 	}
 }
 
@@ -89,6 +149,8 @@ func NewShipRenderer(device *wgpu.Device, surfaceFormat wgpu.TextureFormat, ship
 	modelByPath := make(map[string]int, len(r.ships))
 	for i := range r.ships {
 		ship := &r.ships[i]
+		ship.initialPosition = ship.Position
+		ship.initialHeading = ship.Heading
 		if ship.ModelPath == "" {
 			ship.ModelPath = "assets/models/Roosevelt.glb"
 		}

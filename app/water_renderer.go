@@ -17,18 +17,21 @@ import (
 )
 
 const (
-	waterGridCells           uint32  = 192
-	waterSpectrumTextureSize uint32  = 256
-	waterModeTextureSize     uint32  = 64
-	waterModeCascadeCount    uint32  = 4
-	waterFFTStageCount               = 6
-	waterFrameUniformSize    uint64  = 192
-	waterMaxDistance         float32 = 120000.0
-	waterGridSnap            float32 = 0.0
-	waterChopScale           float32 = 0.66
-	waterFoamGain            float32 = 0.82
-	waterDetailGain          float32 = 1.44
-	waterMotionTimeScale     float32 = 0.80
+	waterGridCells              uint32  = 192
+	waterSpectrumTextureSize    uint32  = 256
+	waterModeTextureSize        uint32  = 64
+	waterModeCascadeCount       uint32  = 4
+	waterFFTStageCount                  = 6
+	waterFrameUniformSize       uint64  = 192
+	waterMaxDistance            float32 = 120000.0
+	waterGridSnap               float32 = 0.0
+	waterChopScale              float32 = 0.66
+	waterFoamGain               float32 = 0.82
+	waterDetailGain             float32 = 1.44
+	waterMotionTimeScale        float32 = 0.80
+	waterInteractionSize        uint32  = 384
+	waterInteractionSpan        float32 = 2560.0
+	waterInteractionUniformSize uint64  = 224
 	// Height knob for quick tuning. This is packed into water_params1.y and
 	// intentionally scales coherent FFT body waves, not high-frequency
 	// capillary normal noise. Raise/lower this first when tuning sea state.
@@ -63,6 +66,8 @@ type WaterFrame struct {
 	SpectrumOriginZ    float32
 	SpectrumWorldSize  float32
 	SpectrumTextureDim float32
+	InteractionOriginX float32
+	InteractionOriginZ float32
 }
 
 func NewWaterFrame(width, height uint32, time, aspect float32, cam *WaterCamera) WaterFrame {
@@ -122,6 +127,7 @@ type WaterRenderer struct {
 	waveDataShaderModule    *wgpu.ShaderModule
 	foamHistoryShaderModule *wgpu.ShaderModule
 	variationShaderModule   *wgpu.ShaderModule
+	interactionShaderModule *wgpu.ShaderModule
 
 	shipRenderer     *ShipRenderer
 	shipDepthTexture *wgpu.Texture
@@ -134,7 +140,8 @@ type WaterRenderer struct {
 	msaaColorWidth   uint32
 	msaaColorHeight  uint32
 
-	uniformBuffer *wgpu.Buffer
+	uniformBuffer            *wgpu.Buffer
+	interactionUniformBuffer *wgpu.Buffer
 
 	h0ModeTexture *wgpu.Texture
 	h0ModeView    *wgpu.TextureView
@@ -173,11 +180,20 @@ type WaterRenderer struct {
 	foamHistoryViewB     *wgpu.TextureView
 	variationTexture     *wgpu.Texture
 	variationView        *wgpu.TextureView
+	interactionTextureA  *wgpu.Texture
+	interactionViewA     *wgpu.TextureView
+	interactionTextureB  *wgpu.Texture
+	interactionViewB     *wgpu.TextureView
 
 	spectrumInitialized    bool
 	variationInitialized   bool
 	foamHistoryInitialized bool
 	foamHistoryFlip        bool
+	interactionInitialized bool
+	interactionFlip        bool
+	interactionOriginX     float32
+	interactionOriginZ     float32
+	interactionLastTime    float32
 
 	renderBindGroupLayout      *wgpu.BindGroupLayout
 	skyBindGroupLayout         *wgpu.BindGroupLayout
@@ -189,6 +205,7 @@ type WaterRenderer struct {
 	waveDataBindGroupLayout    *wgpu.BindGroupLayout
 	foamHistoryBindGroupLayout *wgpu.BindGroupLayout
 	variationBindGroupLayout   *wgpu.BindGroupLayout
+	interactionBindGroupLayout *wgpu.BindGroupLayout
 
 	renderPipelineLayout      *wgpu.PipelineLayout
 	skyPipelineLayout         *wgpu.PipelineLayout
@@ -200,12 +217,15 @@ type WaterRenderer struct {
 	waveDataPipelineLayout    *wgpu.PipelineLayout
 	foamHistoryPipelineLayout *wgpu.PipelineLayout
 	variationPipelineLayout   *wgpu.PipelineLayout
+	interactionPipelineLayout *wgpu.PipelineLayout
 
-	renderBindGroupA *wgpu.BindGroup
-	renderBindGroupB *wgpu.BindGroup
-	skyBindGroup     *wgpu.BindGroup
-	initBindGroup    *wgpu.BindGroup
-	evolveBindGroup  *wgpu.BindGroup
+	renderBindGroupAA *wgpu.BindGroup
+	renderBindGroupAB *wgpu.BindGroup
+	renderBindGroupBA *wgpu.BindGroup
+	renderBindGroupBB *wgpu.BindGroup
+	skyBindGroup      *wgpu.BindGroup
+	initBindGroup     *wgpu.BindGroup
+	evolveBindGroup   *wgpu.BindGroup
 
 	fftEvolvedToPingBindGroup *wgpu.BindGroup
 	fftPingToPongBindGroup    *wgpu.BindGroup
@@ -221,6 +241,8 @@ type WaterRenderer struct {
 	foamHistoryAToBGroup *wgpu.BindGroup
 	foamHistoryBToAGroup *wgpu.BindGroup
 	variationBindGroup   *wgpu.BindGroup
+	interactionAToBGroup *wgpu.BindGroup
+	interactionBToAGroup *wgpu.BindGroup
 
 	renderPipeline                  *wgpu.RenderPipeline
 	renderPipelineMSAA              *wgpu.RenderPipeline
@@ -238,6 +260,7 @@ type WaterRenderer struct {
 	foamHistoryPipeline             *wgpu.ComputePipeline
 	foamHistoryClearPipeline        *wgpu.ComputePipeline
 	variationPipeline               *wgpu.ComputePipeline
+	interactionPipeline             *wgpu.ComputePipeline
 }
 
 func (r *WaterRenderer) SetDebugMode(mode int) {
@@ -453,6 +476,13 @@ func (r *WaterRenderer) createResources() error {
 	if err != nil {
 		return fmt.Errorf("create water variation shader module: %w", err)
 	}
+	r.interactionShaderModule, err = r.device.CreateShaderModule(&wgpu.ShaderModuleDescriptor{
+		Label: "water ship interaction shader",
+		WGSL:  shader.OceanInteractionWGSL,
+	})
+	if err != nil {
+		return fmt.Errorf("create water interaction shader module: %w", err)
+	}
 
 	r.uniformBuffer, err = r.device.CreateBuffer(&wgpu.BufferDescriptor{
 		Label: "water frame uniforms",
@@ -461,6 +491,13 @@ func (r *WaterRenderer) createResources() error {
 	})
 	if err != nil {
 		return fmt.Errorf("create water uniform buffer: %w", err)
+	}
+	r.interactionUniformBuffer, err = r.device.CreateBuffer(&wgpu.BufferDescriptor{
+		Label: "water interaction uniforms", Size: waterInteractionUniformSize,
+		Usage: wgpu.BufferUsageUniform | wgpu.BufferUsageCopyDst,
+	})
+	if err != nil {
+		return fmt.Errorf("create water interaction uniform buffer: %w", err)
 	}
 
 	r.h0ModeTexture, r.h0ModeView, err = r.createModeTexture("water persistent h0 spectral modes texture")
@@ -527,6 +564,14 @@ func (r *WaterRenderer) createResources() error {
 	if err != nil {
 		return fmt.Errorf("create water variation foam breakup texture: %w", err)
 	}
+	r.interactionTextureA, r.interactionViewA, err = r.createRGBA32FloatTexture("water interaction field A", waterInteractionSize, waterInteractionSize)
+	if err != nil {
+		return fmt.Errorf("create water interaction A: %w", err)
+	}
+	r.interactionTextureB, r.interactionViewB, err = r.createRGBA32FloatTexture("water interaction field B", waterInteractionSize, waterInteractionSize)
+	if err != nil {
+		return fmt.Errorf("create water interaction B: %w", err)
+	}
 
 	r.renderBindGroupLayout, err = r.device.CreateBindGroupLayout(&wgpu.BindGroupLayoutDescriptor{
 		Label: "water render bind group layout",
@@ -538,6 +583,7 @@ func (r *WaterRenderer) createResources() error {
 			sampledFloatTextureLayoutEntry(4, wgpu.ShaderStageVertex|wgpu.ShaderStageFragment),
 			sampledFloatTextureLayoutEntry(5, wgpu.ShaderStageVertex|wgpu.ShaderStageFragment),
 			sampledFloatTextureLayoutEntry(6, wgpu.ShaderStageVertex|wgpu.ShaderStageFragment),
+			sampledFloatTextureLayoutEntry(7, wgpu.ShaderStageVertex|wgpu.ShaderStageFragment),
 		},
 	})
 	if err != nil {
@@ -649,6 +695,17 @@ func (r *WaterRenderer) createResources() error {
 	if err != nil {
 		return fmt.Errorf("create water variation bind group layout: %w", err)
 	}
+	r.interactionBindGroupLayout, err = r.device.CreateBindGroupLayout(&wgpu.BindGroupLayoutDescriptor{
+		Label: "water interaction bind group layout",
+		Entries: []wgpu.BindGroupLayoutEntry{
+			{Binding: 0, Visibility: wgpu.ShaderStageCompute, Buffer: &gputypes.BufferBindingLayout{Type: gputypes.BufferBindingTypeUniform, MinBindingSize: waterInteractionUniformSize}},
+			sampledFloatTextureLayoutEntry(1, wgpu.ShaderStageCompute),
+			writeRGBA32StorageTextureLayoutEntry(2, wgpu.ShaderStageCompute),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("create interaction bind group layout: %w", err)
+	}
 
 	r.renderPipelineLayout, err = r.device.CreatePipelineLayout(&wgpu.PipelineLayoutDescriptor{
 		Label:            "water render pipeline layout",
@@ -728,6 +785,12 @@ func (r *WaterRenderer) createResources() error {
 	})
 	if err != nil {
 		return fmt.Errorf("create water variation pipeline layout: %w", err)
+	}
+	r.interactionPipelineLayout, err = r.device.CreatePipelineLayout(&wgpu.PipelineLayoutDescriptor{
+		Label: "water interaction pipeline layout", BindGroupLayouts: []*wgpu.BindGroupLayout{r.interactionBindGroupLayout},
+	})
+	if err != nil {
+		return fmt.Errorf("create interaction pipeline layout: %w", err)
 	}
 
 	r.initBindGroup, err = r.device.CreateBindGroup(&wgpu.BindGroupDescriptor{
@@ -846,15 +909,30 @@ func (r *WaterRenderer) createResources() error {
 	if err != nil {
 		return fmt.Errorf("create water variation bind group: %w", err)
 	}
-
-	r.renderBindGroupA, err = r.createRenderBindGroup("water render bind group A", r.foamHistoryViewA)
+	r.interactionAToBGroup, err = r.createInteractionBindGroup("water interaction A-to-B", r.interactionViewA, r.interactionViewB)
 	if err != nil {
-		return fmt.Errorf("create water render bind group A: %w", err)
+		return fmt.Errorf("create interaction A-to-B group: %w", err)
+	}
+	r.interactionBToAGroup, err = r.createInteractionBindGroup("water interaction B-to-A", r.interactionViewB, r.interactionViewA)
+	if err != nil {
+		return fmt.Errorf("create interaction B-to-A group: %w", err)
 	}
 
-	r.renderBindGroupB, err = r.createRenderBindGroup("water render bind group B", r.foamHistoryViewB)
+	r.renderBindGroupAA, err = r.createRenderBindGroup("water render foam A interaction A", r.foamHistoryViewA, r.interactionViewA)
 	if err != nil {
-		return fmt.Errorf("create water render bind group B: %w", err)
+		return fmt.Errorf("create water render bind group AA: %w", err)
+	}
+	r.renderBindGroupAB, err = r.createRenderBindGroup("water render foam A interaction B", r.foamHistoryViewA, r.interactionViewB)
+	if err != nil {
+		return fmt.Errorf("create water render bind group AB: %w", err)
+	}
+	r.renderBindGroupBA, err = r.createRenderBindGroup("water render foam B interaction A", r.foamHistoryViewB, r.interactionViewA)
+	if err != nil {
+		return fmt.Errorf("create water render bind group BA: %w", err)
+	}
+	r.renderBindGroupBB, err = r.createRenderBindGroup("water render foam B interaction B", r.foamHistoryViewB, r.interactionViewB)
+	if err != nil {
+		return fmt.Errorf("create water render bind group BB: %w", err)
 	}
 
 	r.skyBindGroup, err = r.device.CreateBindGroup(&wgpu.BindGroupDescriptor{
@@ -996,6 +1074,13 @@ func (r *WaterRenderer) createResources() error {
 	if err != nil {
 		return fmt.Errorf("create water variation pipeline: %w", err)
 	}
+	r.interactionPipeline, err = r.device.CreateComputePipeline(&wgpu.ComputePipelineDescriptor{
+		Label: "water ship interaction pipeline", Layout: r.interactionPipelineLayout,
+		Module: r.interactionShaderModule, EntryPoint: "cs_main",
+	})
+	if err != nil {
+		return fmt.Errorf("create interaction pipeline: %w", err)
+	}
 
 	r.skyPipeline, err = r.createSkyPipeline(1)
 	if err != nil {
@@ -1105,7 +1190,18 @@ func (r *WaterRenderer) createFoamHistoryBindGroup(label string, previous, outpu
 	})
 }
 
-func (r *WaterRenderer) createRenderBindGroup(label string, foamHistory *wgpu.TextureView) (*wgpu.BindGroup, error) {
+func (r *WaterRenderer) createInteractionBindGroup(label string, previous, output *wgpu.TextureView) (*wgpu.BindGroup, error) {
+	return r.device.CreateBindGroup(&wgpu.BindGroupDescriptor{
+		Label: label, Layout: r.interactionBindGroupLayout,
+		Entries: []wgpu.BindGroupEntry{
+			{Binding: 0, Buffer: r.interactionUniformBuffer, Size: waterInteractionUniformSize},
+			{Binding: 1, TextureView: previous},
+			{Binding: 2, TextureView: output},
+		},
+	})
+}
+
+func (r *WaterRenderer) createRenderBindGroup(label string, foamHistory, interaction *wgpu.TextureView) (*wgpu.BindGroup, error) {
 	return r.device.CreateBindGroup(&wgpu.BindGroupDescriptor{
 		Label:  label,
 		Layout: r.renderBindGroupLayout,
@@ -1117,6 +1213,7 @@ func (r *WaterRenderer) createRenderBindGroup(label string, foamHistory *wgpu.Te
 			{Binding: 4, TextureView: r.waveDataView},
 			{Binding: 5, TextureView: foamHistory},
 			{Binding: 6, TextureView: r.variationView},
+			{Binding: 7, TextureView: interaction},
 		},
 	})
 }
@@ -1278,15 +1375,29 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 		return err
 	}
 
-	uniformBytes := packWaterFrame(frame)
-
 	queue := r.device.Queue()
 	if queue == nil {
 		return fmt.Errorf("nil wgpu queue")
 	}
 
+	r.shipRenderer.UpdateMotion(frame.Time)
+	originX, originZ := interactionFieldOrigin(r.shipRenderer)
+	frame.InteractionOriginX = originX
+	frame.InteractionOriginZ = originZ
+	uniformBytes := packWaterFrame(frame)
 	if err := queue.WriteBuffer(r.uniformBuffer, 0, uniformBytes); err != nil {
 		return fmt.Errorf("write water uniforms: %w", err)
+	}
+	dt := frame.Time - r.interactionLastTime
+	if dt <= 0 || dt > 0.10 {
+		dt = 1.0 / 60.0
+	}
+	prevX, prevZ := r.interactionOriginX, r.interactionOriginZ
+	if !r.interactionInitialized {
+		prevX, prevZ = originX+waterInteractionSpan*4, originZ+waterInteractionSpan*4
+	}
+	if err := queue.WriteBuffer(r.interactionUniformBuffer, 0, packInteractionFrame(r.shipRenderer, originX, originZ, prevX, prevZ, frame.Time, dt)); err != nil {
+		return fmt.Errorf("write water interaction uniforms: %w", err)
 	}
 
 	encoder, err := r.device.CreateCommandEncoder(&wgpu.CommandEncoderDescriptor{
@@ -1359,15 +1470,33 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 	}
 
 	foamHistoryBindGroup := r.foamHistoryAToBGroup
-	renderBindGroup := r.renderBindGroupB
+	renderFoamB := true
 	if r.foamHistoryFlip {
 		foamHistoryBindGroup = r.foamHistoryBToAGroup
-		renderBindGroup = r.renderBindGroupA
+		renderFoamB = false
 	}
 
 	if err = dispatchWaterComputePass(encoder, "water temporal foam history pass", r.foamHistoryPipeline, foamHistoryBindGroup, (waterSpectrumTextureSize+7)/8, (waterSpectrumTextureSize+7)/8, 1); err != nil {
 		encoder.DiscardEncoding()
 		return err
+	}
+	interactionGroup := r.interactionAToBGroup
+	renderInteractionB := true
+	if r.interactionFlip {
+		interactionGroup = r.interactionBToAGroup
+		renderInteractionB = false
+	}
+	if err = dispatchWaterComputePass(encoder, "water ship interaction pass", r.interactionPipeline, interactionGroup, (waterInteractionSize+7)/8, (waterInteractionSize+7)/8, 1); err != nil {
+		encoder.DiscardEncoding()
+		return err
+	}
+	renderBindGroup := r.renderBindGroupAA
+	if renderFoamB && renderInteractionB {
+		renderBindGroup = r.renderBindGroupBB
+	} else if renderFoamB {
+		renderBindGroup = r.renderBindGroupBA
+	} else if renderInteractionB {
+		renderBindGroup = r.renderBindGroupAB
 	}
 
 	colorTarget := target
@@ -1455,6 +1584,10 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 	}
 	r.foamHistoryInitialized = true
 	r.foamHistoryFlip = !r.foamHistoryFlip
+	r.interactionInitialized = true
+	r.interactionFlip = !r.interactionFlip
+	r.interactionOriginX, r.interactionOriginZ = originX, originZ
+	r.interactionLastTime = frame.Time
 
 	return nil
 }
@@ -1593,8 +1726,63 @@ func packWaterFrame(frame WaterFrame) []byte {
 		frame.CameraForward.X, frame.CameraForward.Y, frame.CameraForward.Z, 0.0,
 		waterGridSnap, waterChopScale, waterFoamGain, waterDetailGain,
 		frame.SpectrumOriginX, frame.SpectrumOriginZ, frame.SpectrumWorldSize, frame.SpectrumTextureDim,
-		frame.DebugMode, frame.WaveHeightScale, 0.0, 0.0,
+		frame.DebugMode, frame.WaveHeightScale, frame.InteractionOriginX, frame.InteractionOriginZ,
 	)
+	return util.Float32Bytes(values...)
+}
+
+func interactionFieldOrigin(renderer *ShipRenderer) (float32, float32) {
+	ships := renderer.Interactions()
+	if len(ships) == 0 {
+		return -waterInteractionSpan * 0.5, -waterInteractionSpan * 0.5
+	}
+	var centerX, centerZ, forwardX, forwardZ float32
+	for _, ship := range ships {
+		centerX += ship.Position.X
+		centerZ += ship.Position.Z
+		forwardX += ship.Forward.X
+		forwardZ += ship.Forward.Z
+	}
+	invCount := 1 / float32(len(ships))
+	centerX *= invCount
+	centerZ *= invCount
+	forwardX *= invCount
+	forwardZ *= invCount
+	forwardLength := float32(math.Hypot(float64(forwardX), float64(forwardZ)))
+	if forwardLength > 0.001 {
+		forwardX /= forwardLength
+		forwardZ /= forwardLength
+	}
+	// Bias the field behind the fleet so long propeller and Kelvin wakes retain
+	// resolution instead of spending half the texture in front of the bows.
+	centerX -= forwardX * waterInteractionSpan * 0.20
+	centerZ -= forwardZ * waterInteractionSpan * 0.20
+	texel := waterInteractionSpan / float32(waterInteractionSize)
+	originX := float32(math.Floor(float64((centerX-waterInteractionSpan*0.5)/texel))) * texel
+	originZ := float32(math.Floor(float64((centerZ-waterInteractionSpan*0.5)/texel))) * texel
+	return originX, originZ
+}
+
+func packInteractionFrame(renderer *ShipRenderer, originX, originZ, prevX, prevZ, time, dt float32) []byte {
+	ships := renderer.Interactions()
+	if len(ships) > 4 {
+		ships = ships[:4]
+	}
+	values := make([]float32, 0, int(waterInteractionUniformSize/4))
+	values = append(values, originX, originZ, waterInteractionSpan, dt)
+	values = append(values, prevX, prevZ, time, float32(len(ships)))
+	for i := 0; i < 4; i++ {
+		if i < len(ships) {
+			s := ships[i]
+			values = append(values,
+				s.Position.X, s.Position.Z, s.Speed, s.Strength,
+				s.Forward.X, s.Forward.Z, s.Length, s.Beam,
+				s.Draft, s.Propellers, s.Phase, 0,
+			)
+		} else {
+			values = append(values, make([]float32, 12)...)
+		}
+	}
 	return util.Float32Bytes(values...)
 }
 
@@ -1680,6 +1868,7 @@ func (r *WaterRenderer) Release() {
 	releaseRenderPipeline(&r.skyPipelineMSAA)
 	releaseRenderPipeline(&r.skyPipeline)
 	releaseComputePipeline(&r.variationPipeline)
+	releaseComputePipeline(&r.interactionPipeline)
 	releaseComputePipeline(&r.foamHistoryClearPipeline)
 	releaseComputePipeline(&r.foamHistoryPipeline)
 	releaseComputePipeline(&r.waveDataPipeline)
@@ -1696,10 +1885,14 @@ func (r *WaterRenderer) Release() {
 	releaseComputePipeline(&r.evolvePipeline)
 	releaseComputePipeline(&r.initPipeline)
 
-	releaseBindGroup(&r.renderBindGroupB)
-	releaseBindGroup(&r.renderBindGroupA)
+	releaseBindGroup(&r.renderBindGroupBB)
+	releaseBindGroup(&r.renderBindGroupBA)
+	releaseBindGroup(&r.renderBindGroupAB)
+	releaseBindGroup(&r.renderBindGroupAA)
 	releaseBindGroup(&r.skyBindGroup)
 	releaseBindGroup(&r.variationBindGroup)
+	releaseBindGroup(&r.interactionBToAGroup)
+	releaseBindGroup(&r.interactionAToBGroup)
 	releaseBindGroup(&r.foamHistoryBToAGroup)
 	releaseBindGroup(&r.foamHistoryAToBGroup)
 	releaseBindGroup(&r.waveDataBindGroup)
@@ -1717,6 +1910,7 @@ func (r *WaterRenderer) Release() {
 	releasePipelineLayout(&r.renderPipelineLayout)
 	releasePipelineLayout(&r.skyPipelineLayout)
 	releasePipelineLayout(&r.variationPipelineLayout)
+	releasePipelineLayout(&r.interactionPipelineLayout)
 	releasePipelineLayout(&r.foamHistoryPipelineLayout)
 	releasePipelineLayout(&r.waveDataPipelineLayout)
 	releasePipelineLayout(&r.filterPipelineLayout)
@@ -1728,6 +1922,7 @@ func (r *WaterRenderer) Release() {
 	releaseBindGroupLayout(&r.renderBindGroupLayout)
 	releaseBindGroupLayout(&r.skyBindGroupLayout)
 	releaseBindGroupLayout(&r.variationBindGroupLayout)
+	releaseBindGroupLayout(&r.interactionBindGroupLayout)
 	releaseBindGroupLayout(&r.foamHistoryBindGroupLayout)
 	releaseBindGroupLayout(&r.waveDataBindGroupLayout)
 	releaseBindGroupLayout(&r.filterBindGroupLayout)
@@ -1738,6 +1933,10 @@ func (r *WaterRenderer) Release() {
 
 	releaseTextureView(&r.variationView)
 	releaseTexture(&r.variationTexture)
+	releaseTextureView(&r.interactionViewB)
+	releaseTexture(&r.interactionTextureB)
+	releaseTextureView(&r.interactionViewA)
+	releaseTexture(&r.interactionTextureA)
 	releaseTextureView(&r.foamHistoryViewB)
 	releaseTexture(&r.foamHistoryTextureB)
 	releaseTextureView(&r.foamHistoryViewA)
@@ -1763,9 +1962,11 @@ func (r *WaterRenderer) Release() {
 	releaseTextureView(&r.h0ModeView)
 	releaseTexture(&r.h0ModeTexture)
 
+	releaseBuffer(&r.interactionUniformBuffer)
 	releaseBuffer(&r.uniformBuffer)
 
 	releaseShaderModule(&r.variationShaderModule)
+	releaseShaderModule(&r.interactionShaderModule)
 	releaseShaderModule(&r.foamHistoryShaderModule)
 	releaseShaderModule(&r.waveDataShaderModule)
 	releaseShaderModule(&r.filterShaderModule)

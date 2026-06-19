@@ -37,6 +37,7 @@ const (
 	debugModeFoamHistory
 	debugModeVariation
 	debugModeRoughness
+	debugModeInteraction
 	debugModeCount
 )
 
@@ -56,6 +57,8 @@ func debugModeLabel(mode int) string {
 		return "variation"
 	case debugModeRoughness:
 		return "roughness"
+	case debugModeInteraction:
+		return "ship interaction"
 	default:
 		return "final"
 	}

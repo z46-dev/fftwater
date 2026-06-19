@@ -17,7 +17,8 @@ struct FrameUniforms {
     // x = spectrum origin world x, y = spectrum origin world z,
     // z = spectrum world span, w = spectrum texture dimension.
     spectrum_params: vec4<f32>,
-    // x = debug view mode, y = coherent FFT/body height scale, zw reserved.
+    // x = debug view mode, y = coherent FFT/body height scale,
+    // zw = ship-interaction field origin x/z.
     water_params1: vec4<f32>,
 };
 
@@ -61,6 +62,9 @@ var foam_history_tex: texture_2d<f32>;
 // B = low-frequency foam breakup, A = high-frequency foam lace.
 @group(0) @binding(6)
 var variation_tex: texture_2d<f32>;
+// RG = interaction slope x/z, B = displacement height, A = wake foam.
+@group(0) @binding(7)
+var interaction_tex: texture_2d<f32>;
 
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
@@ -73,6 +77,7 @@ struct VertexOut {
     @location(6) foam_history: vec4<f32>,
     @location(7) small_wave_detail: vec4<f32>,
     @location(8) field_support: f32,
+    @location(9) interaction: vec4<f32>,
 };
 
 struct WaveContrib {
@@ -137,6 +142,13 @@ fn debug_visualize(mode: i32, in_data: VertexOut, normal: vec3<f32>, slope_mag: 
     }
     if mode == 7 {
         return vec3<f32>(roughness, foam, clamp(slope_mag * 0.55 + variation_mix * 0.25, 0.0, 1.0));
+    }
+    if mode == 8 {
+        return vec3<f32>(
+            clamp(length(in_data.interaction.xy) * 5.0, 0.0, 1.0),
+            clamp(in_data.interaction.w, 0.0, 1.0),
+            clamp(in_data.interaction.z * 1.5 + 0.5, 0.0, 1.0)
+        );
     }
     return normal * 0.5 + vec3<f32>(0.5);
 }
@@ -235,6 +247,25 @@ fn sample_variation_uv(uv_in: vec2<f32>) -> vec4<f32> {
 
 fn sample_variation_world(p: vec2<f32>, scale: f32, offset: vec2<f32>) -> vec4<f32> {
     return sample_variation_uv(p * scale + offset);
+}
+
+fn sample_interaction_field(p: vec2<f32>) -> vec4<f32> {
+    let dims = textureDimensions(interaction_tex, 0);
+    let span = 2560.0;
+    let origin = frame.water_params1.zw;
+    let uv = (p - origin) / span;
+    if uv.x <= 0.0 || uv.y <= 0.0 || uv.x >= 1.0 || uv.y >= 1.0 {
+        return vec4<f32>(0.0);
+    }
+    let coord = uv * vec2<f32>(dims) - vec2<f32>(0.5);
+    let i0 = vec2<i32>(floor(coord));
+    let f = fract(coord);
+    let hi = vec2<i32>(dims) - vec2<i32>(1);
+    let a = textureLoad(interaction_tex, clamp(i0, vec2<i32>(0), hi), 0);
+    let b = textureLoad(interaction_tex, clamp(i0 + vec2<i32>(1, 0), vec2<i32>(0), hi), 0);
+    let c = textureLoad(interaction_tex, clamp(i0 + vec2<i32>(0, 1), vec2<i32>(0), hi), 0);
+    let d = textureLoad(interaction_tex, clamp(i0 + vec2<i32>(1, 1), vec2<i32>(0), hi), 0);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
 fn wind_streak_variation(p: vec2<f32>) -> f32 {
@@ -1012,6 +1043,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
     let field = sample_spectrum_field(base_xz);
     let wave_data = sample_wave_data_field(base_xz);
     let foam_history = sample_foam_history_field(base_xz);
+    let interaction = sample_interaction_field(base_xz);
     let field_support = expanded_field_support(base_xz);
     let edge_fade = projected_grid_edge_fade(uv);
 
@@ -1039,7 +1071,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
     let rough_lift = clamp(wave_data.z * 0.030 + foam_history.z * 0.014, 0.0, 0.045) * field_weight;
     let crestlet_geo_gate = smoothstep(24.0, 74.0, base_view_distance) * (1.0 - smoothstep(980.0, 2200.0, base_view_distance));
     let geom_disp = shaped_direct.disp * (0.060 * direct_weight) + field.xz * (0.0016 * field_weight) + crestlets.disp * (0.006 * crestlet_geo_gate);
-    let geom_h = shaped_direct.height * (0.22 * direct_weight) + field.y * (0.0020 * field_weight * frame.water_params1.y) + rough_lift * 0.20 + crestlets.height * (0.12 * crestlet_geo_gate);
+    let geom_h = shaped_direct.height * (0.22 * direct_weight) + field.y * (0.0020 * field_weight * frame.water_params1.y) + rough_lift * 0.20 + crestlets.height * (0.12 * crestlet_geo_gate) + interaction.z * 0.72;
 
     let world = vec3<f32>(
         base_xz.x + geom_disp.x * edge_fade,
@@ -1064,6 +1096,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
     out.foam_history = mix(vec4<f32>(0.0), foam_history, field_support);
     out.small_wave_detail = vec4<f32>(crestlets.slope, clamp(-crestlets.curvature * 2.8, 0.0, 1.0), clamp(length(crestlets.slope) * 0.72, 0.0, 1.0));
     out.field_support = field_support;
+    out.interaction = interaction;
     return out;
 }
 
@@ -1075,7 +1108,7 @@ fn geometric_normal(world_pos: vec3<f32>) -> vec3<f32> {
     return n;
 }
 
-fn ocean_normal(world_pos: vec3<f32>, base_xz: vec2<f32>, wave_data: vec4<f32>, foam_history: vec4<f32>, small_wave_detail: vec4<f32>, view_distance: f32, field_support: f32) -> vec3<f32> {
+fn ocean_normal(world_pos: vec3<f32>, base_xz: vec2<f32>, wave_data: vec4<f32>, foam_history: vec4<f32>, small_wave_detail: vec4<f32>, view_distance: f32, field_support: f32, interaction_slope: vec2<f32>) -> vec3<f32> {
     // Keep the fragment path cheap.  Vertex FFT supplies coherent body motion;
     // this path adds nearby mini-wave roughness as a normal/detail signal.
     let geom = geometric_normal(world_pos);
@@ -1092,7 +1125,7 @@ fn ocean_normal(world_pos: vec3<f32>, base_xz: vec2<f32>, wave_data: vec4<f32>, 
     let capillary_slope = detail.slope * frame.water_params0.w * (0.98 + near_micro * 0.78) * max(coherent_gate, 0.72) * far_stable;
     let moment_slope = (wave_data.xy * lowres_weight) * mix(0.28, 0.72, rough_memory);
     let foam_suppression = 1.0 - foam_history.x * 0.18;
-    let slope = (geom_slope * 0.09 + moment_slope * 0.38 + vertex_short_slope + capillary_slope) * foam_suppression;
+    let slope = (geom_slope * 0.09 + moment_slope * 0.38 + vertex_short_slope + capillary_slope + interaction_slope) * foam_suppression;
     return normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
 }
 
@@ -1185,7 +1218,7 @@ fn water_volume_color(
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let cam = frame.camera_pos_fov.xyz;
-    var n = ocean_normal(in.world_pos, in.base_xz, in.wave_data, in.foam_history, in.small_wave_detail, in.view_distance, in.field_support);
+    var n = ocean_normal(in.world_pos, in.base_xz, in.wave_data, in.foam_history, in.small_wave_detail, in.view_distance, in.field_support, in.interaction.xy);
     // Beyond a few kilometers, projected wave normals become sub-pixel and
     // produce crawling lines near the horizon. Converge them toward a stable
     // broad-ocean normal before evaluating lighting and reflections.
@@ -1215,7 +1248,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     );
     surface_variation = surface_variation * 0.5 + vec4<f32>(0.5);
     surface_variation = mix(surface_variation, vec4<f32>(0.5), horizon_stabilize);
-    let foam = crest_foam(in.view_distance, in.foam_signal, in.wave_data, in.foam_history, in.small_wave_detail, surface_variation);
+    let foam = clamp(crest_foam(in.view_distance, in.foam_signal, in.wave_data, in.foam_history, in.small_wave_detail, surface_variation) + in.interaction.w * 0.68, 0.0, 0.86);
     let height_t = clamp(in.field_height * 0.16 + 0.48, 0.0, 1.0);
     // Reuse normal derivatives and the animated material variation to expose
     // small folds and occasional micro-caps. No additional noise lookup is
