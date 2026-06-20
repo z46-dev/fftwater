@@ -12,7 +12,9 @@ const (
 	waterCameraScrollZoomStep  float32 = 10.0
 	waterCameraScrollShiftGain float32 = 3.0
 	waterCameraMinPitch        float32 = -1.35
-	waterCameraMaxPitch        float32 = 0.08
+	waterCameraMaxPitch        float32 = 1.35
+	waterCameraMinHeight       float32 = -2000.0
+	waterCameraMaxHeight       float32 = 5000.0
 	waterCameraDefaultFOV      float32 = 62.0 * math.Pi / 180.0
 	waterCameraDefaultNear     float32 = 0.25
 	waterCameraDefaultFar      float32 = 260000.0
@@ -110,7 +112,7 @@ func (c *WaterCamera) ApplyZoomScroll(delta float32, fast bool) {
 	}
 
 	c.Position = c.Position.Add(forward.Mul(mag * step))
-	c.clampAboveWater()
+	c.clampNavigableHeight()
 }
 
 func (c *WaterCamera) Basis() (forward, right, up Vec3) {
@@ -148,6 +150,12 @@ func (c *WaterCamera) Update(dt float32, in *input.State) {
 	if keyboard.Pressed(input.KeyA) || keyboard.Pressed(input.KeyLeft) {
 		move = move.Sub(flatRight)
 	}
+	if keyboard.Pressed(input.KeySpace) {
+		move.Y += 1
+	}
+	if keyboard.Pressed(input.KeyControlLeft) || keyboard.Pressed(input.KeyControlRight) {
+		move.Y -= 1
+	}
 
 	if dot3(move, move) > 0.0001 {
 		move = normalize3(move)
@@ -159,13 +167,11 @@ func (c *WaterCamera) Update(dt float32, in *input.State) {
 	}
 
 	c.Position = c.Position.Add(move.Mul(speed * dt))
-	c.clampAboveWater()
+	c.clampNavigableHeight()
 }
 
-func (c *WaterCamera) clampAboveWater() {
-	if c.Position.Y < 2.0 {
-		c.Position.Y = 2.0
-	}
+func (c *WaterCamera) clampNavigableHeight() {
+	c.Position.Y = clamp32(c.Position.Y, waterCameraMinHeight, waterCameraMaxHeight)
 }
 
 func (c *WaterCamera) ViewProj(aspect float32) Mat4 {

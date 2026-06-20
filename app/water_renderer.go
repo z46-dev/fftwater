@@ -17,20 +17,24 @@ import (
 )
 
 const (
-	waterGridCells              uint32  = 192
-	waterSpectrumTextureSize    uint32  = 256
-	waterModeTextureSize        uint32  = 64
-	waterModeCascadeCount       uint32  = 4
-	waterFFTStageCount                  = 6
-	waterFrameUniformSize       uint64  = 192
-	waterMaxDistance            float32 = 120000.0
-	waterGridSnap               float32 = 0.0
-	waterChopScale              float32 = 0.66
-	waterFoamGain               float32 = 0.82
-	waterDetailGain             float32 = 1.44
-	waterMotionTimeScale        float32 = 0.80
-	waterInteractionSize        uint32  = 384
+	waterGridCells           uint32  = 160
+	waterSpectrumTextureSize uint32  = 256
+	waterModeTextureSize     uint32  = 64
+	waterModeCascadeCount    uint32  = 4
+	waterFFTStageCount               = 6
+	waterFrameUniformSize    uint64  = 192
+	waterMaxDistance         float32 = 120000.0
+	waterGridSnap            float32 = 0.0
+	waterChopScale           float32 = 0.66
+	waterFoamGain            float32 = 0.82
+	waterDetailGain          float32 = 1.44
+	waterMotionTimeScale     float32 = 0.80
+	// 512² gives a 5m texel over the local field. Per-fragment footprint
+	// filtering handles distance aliasing without paying the 2.25x compute and
+	// bandwidth cost of the previous 768² field.
+	waterInteractionSize        uint32  = 512
 	waterInteractionSpan        float32 = 2560.0
+	waterInteractionStep        float32 = 1.0 / 30.0
 	waterInteractionUniformSize uint64  = 224
 	// Height knob for quick tuning. This is packed into water_params1.y and
 	// intentionally scales coherent FFT body waves, not high-frequency
@@ -38,7 +42,30 @@ const (
 	waterHeightScaleDefault float32            = 0.92
 	waterSpectrumWorldSize  float32            = 3072.0
 	shipDepthFormat         wgpu.TextureFormat = gputypes.TextureFormatDepth32Float
+	shipEffectFormat        wgpu.TextureFormat = gputypes.TextureFormatRGBA8Unorm
 )
+
+type ShipReflectionQuality int
+
+const (
+	ShipReflectionOff ShipReflectionQuality = iota
+	ShipReflectionLow
+	ShipReflectionMedium
+	ShipReflectionHigh
+)
+
+func (q ShipReflectionQuality) Label() string {
+	switch q {
+	case ShipReflectionLow:
+		return "low"
+	case ShipReflectionMedium:
+		return "medium"
+	case ShipReflectionHigh:
+		return "high"
+	default:
+		return "off"
+	}
+}
 
 // WaterFrame contains the per-frame inputs for the projected water grid.
 // The uniforms deliberately expose camera basis vectors instead of hiding the
@@ -129,16 +156,30 @@ type WaterRenderer struct {
 	variationShaderModule   *wgpu.ShaderModule
 	interactionShaderModule *wgpu.ShaderModule
 
-	shipRenderer     *ShipRenderer
-	shipDepthTexture *wgpu.Texture
-	shipDepthView    *wgpu.TextureView
-	shipDepthWidth   uint32
-	shipDepthHeight  uint32
-	shipDepthSamples uint32
-	msaaColorTexture *wgpu.Texture
-	msaaColorView    *wgpu.TextureView
-	msaaColorWidth   uint32
-	msaaColorHeight  uint32
+	shipRenderer           *ShipRenderer
+	shipDepthTexture       *wgpu.Texture
+	shipDepthView          *wgpu.TextureView
+	shipDepthWidth         uint32
+	shipDepthHeight        uint32
+	shipDepthSamples       uint32
+	shipReflections        ShipReflectionQuality
+	shipShadows            bool
+	reflectionTexture      *wgpu.Texture
+	reflectionView         *wgpu.TextureView
+	reflectionDepthTexture *wgpu.Texture
+	reflectionDepthView    *wgpu.TextureView
+	reflectionWidth        uint32
+	reflectionHeight       uint32
+	shadowTexture          *wgpu.Texture
+	shadowView             *wgpu.TextureView
+	shadowDepthTexture     *wgpu.Texture
+	shadowDepthView        *wgpu.TextureView
+	shadowWidth            uint32
+	shadowHeight           uint32
+	msaaColorTexture       *wgpu.Texture
+	msaaColorView          *wgpu.TextureView
+	msaaColorWidth         uint32
+	msaaColorHeight        uint32
 
 	uniformBuffer            *wgpu.Buffer
 	interactionUniformBuffer *wgpu.Buffer
@@ -184,6 +225,7 @@ type WaterRenderer struct {
 	interactionViewA     *wgpu.TextureView
 	interactionTextureB  *wgpu.Texture
 	interactionViewB     *wgpu.TextureView
+	interactionSampler   *wgpu.Sampler
 
 	spectrumInitialized    bool
 	variationInitialized   bool
@@ -296,6 +338,41 @@ func (r *WaterRenderer) ShipAAEnabled() bool {
 	return r != nil && r.shipAA
 }
 
+func (r *WaterRenderer) SetShipReflectionQuality(quality ShipReflectionQuality) {
+	if r == nil {
+		return
+	}
+	if quality < ShipReflectionOff {
+		quality = ShipReflectionOff
+	} else if quality > ShipReflectionHigh {
+		quality = ShipReflectionHigh
+	}
+	if r.shipReflections != quality {
+		r.shipReflections = quality
+		r.reflectionWidth = 0
+		r.reflectionHeight = 0
+	}
+}
+
+func (r *WaterRenderer) ShipReflectionQuality() ShipReflectionQuality {
+	if r == nil {
+		return ShipReflectionOff
+	}
+	return r.shipReflections
+}
+
+func (r *WaterRenderer) SetShipShadows(enabled bool) {
+	if r != nil && r.shipShadows != enabled {
+		r.shipShadows = enabled
+		r.shadowWidth = 0
+		r.shadowHeight = 0
+	}
+}
+
+func (r *WaterRenderer) ShipShadowsEnabled() bool {
+	return r != nil && r.shipShadows
+}
+
 func NewWaterRenderer(device *wgpu.Device, surfaceFormat wgpu.TextureFormat) (*WaterRenderer, error) {
 	if device == nil {
 		return nil, fmt.Errorf("nil wgpu device")
@@ -317,6 +394,10 @@ func NewWaterRenderer(device *wgpu.Device, surfaceFormat wgpu.TextureFormat) (*W
 }
 
 func (r *WaterRenderer) createRGBA32FloatTexture(label string, width, height uint32) (*wgpu.Texture, *wgpu.TextureView, error) {
+	return r.createFloatTexture(label, width, height, gputypes.TextureFormatRGBA32Float)
+}
+
+func (r *WaterRenderer) createFloatTexture(label string, width, height uint32, format wgpu.TextureFormat) (*wgpu.Texture, *wgpu.TextureView, error) {
 	tex, err := r.device.CreateTexture(&wgpu.TextureDescriptor{
 		Label: label,
 		Size: wgpu.Extent3D{
@@ -327,7 +408,7 @@ func (r *WaterRenderer) createRGBA32FloatTexture(label string, width, height uin
 		MipLevelCount: 1,
 		SampleCount:   1,
 		Dimension:     wgpu.TextureDimension2D,
-		Format:        gputypes.TextureFormatRGBA32Float,
+		Format:        format,
 		Usage:         wgpu.TextureUsageStorageBinding | wgpu.TextureUsageTextureBinding,
 	})
 	if err != nil {
@@ -336,7 +417,7 @@ func (r *WaterRenderer) createRGBA32FloatTexture(label string, width, height uin
 
 	view, err := r.device.CreateTextureView(tex, &wgpu.TextureViewDescriptor{
 		Label:           label + " view",
-		Format:          gputypes.TextureFormatRGBA32Float,
+		Format:          format,
 		Dimension:       gputypes.TextureViewDimension2D,
 		Aspect:          gputypes.TextureAspectAll,
 		BaseMipLevel:    0,
@@ -382,16 +463,31 @@ func sampledFloatTextureLayoutEntry(binding uint32, visibility wgpu.ShaderStages
 	}
 }
 
-func writeRGBA32StorageTextureLayoutEntry(binding uint32, visibility wgpu.ShaderStages) wgpu.BindGroupLayoutEntry {
+func sampledFilterableFloatTextureLayoutEntry(binding uint32, visibility wgpu.ShaderStages) wgpu.BindGroupLayoutEntry {
+	return wgpu.BindGroupLayoutEntry{
+		Binding:    binding,
+		Visibility: visibility,
+		Texture: &gputypes.TextureBindingLayout{
+			SampleType:    gputypes.TextureSampleTypeFloat,
+			ViewDimension: gputypes.TextureViewDimension2D,
+		},
+	}
+}
+
+func writeFloatStorageTextureLayoutEntry(binding uint32, visibility wgpu.ShaderStages, format wgpu.TextureFormat) wgpu.BindGroupLayoutEntry {
 	return wgpu.BindGroupLayoutEntry{
 		Binding:    binding,
 		Visibility: visibility,
 		StorageTexture: &gputypes.StorageTextureBindingLayout{
 			Access:        gputypes.StorageTextureAccessWriteOnly,
-			Format:        gputypes.TextureFormatRGBA32Float,
+			Format:        format,
 			ViewDimension: gputypes.TextureViewDimension2D,
 		},
 	}
+}
+
+func writeRGBA32StorageTextureLayoutEntry(binding uint32, visibility wgpu.ShaderStages) wgpu.BindGroupLayoutEntry {
+	return writeFloatStorageTextureLayoutEntry(binding, visibility, gputypes.TextureFormatRGBA32Float)
 }
 
 func (r *WaterRenderer) createResources() error {
@@ -564,13 +660,27 @@ func (r *WaterRenderer) createResources() error {
 	if err != nil {
 		return fmt.Errorf("create water variation foam breakup texture: %w", err)
 	}
-	r.interactionTextureA, r.interactionViewA, err = r.createRGBA32FloatTexture("water interaction field A", waterInteractionSize, waterInteractionSize)
+	r.interactionTextureA, r.interactionViewA, err = r.createFloatTexture("water interaction field A", waterInteractionSize, waterInteractionSize, gputypes.TextureFormatRGBA16Float)
 	if err != nil {
 		return fmt.Errorf("create water interaction A: %w", err)
 	}
-	r.interactionTextureB, r.interactionViewB, err = r.createRGBA32FloatTexture("water interaction field B", waterInteractionSize, waterInteractionSize)
+	r.interactionTextureB, r.interactionViewB, err = r.createFloatTexture("water interaction field B", waterInteractionSize, waterInteractionSize, gputypes.TextureFormatRGBA16Float)
 	if err != nil {
 		return fmt.Errorf("create water interaction B: %w", err)
+	}
+	r.interactionSampler, err = r.device.CreateSampler(&wgpu.SamplerDescriptor{
+		Label:        "water interaction linear clamp sampler",
+		AddressModeU: gputypes.AddressModeClampToEdge,
+		AddressModeV: gputypes.AddressModeClampToEdge,
+		AddressModeW: gputypes.AddressModeClampToEdge,
+		MagFilter:    gputypes.FilterModeLinear,
+		MinFilter:    gputypes.FilterModeLinear,
+		MipmapFilter: gputypes.FilterModeNearest,
+		LodMinClamp:  0,
+		LodMaxClamp:  0,
+	})
+	if err != nil {
+		return fmt.Errorf("create water interaction sampler: %w", err)
 	}
 
 	r.renderBindGroupLayout, err = r.device.CreateBindGroupLayout(&wgpu.BindGroupLayoutDescriptor{
@@ -583,7 +693,10 @@ func (r *WaterRenderer) createResources() error {
 			sampledFloatTextureLayoutEntry(4, wgpu.ShaderStageVertex|wgpu.ShaderStageFragment),
 			sampledFloatTextureLayoutEntry(5, wgpu.ShaderStageVertex|wgpu.ShaderStageFragment),
 			sampledFloatTextureLayoutEntry(6, wgpu.ShaderStageVertex|wgpu.ShaderStageFragment),
-			sampledFloatTextureLayoutEntry(7, wgpu.ShaderStageVertex|wgpu.ShaderStageFragment),
+			sampledFilterableFloatTextureLayoutEntry(7, wgpu.ShaderStageVertex|wgpu.ShaderStageFragment),
+			sampledFloatTextureLayoutEntry(8, wgpu.ShaderStageFragment),
+			sampledFloatTextureLayoutEntry(9, wgpu.ShaderStageFragment),
+			{Binding: 10, Visibility: wgpu.ShaderStageVertex | wgpu.ShaderStageFragment, Sampler: &gputypes.SamplerBindingLayout{Type: gputypes.SamplerBindingTypeFiltering}},
 		},
 	})
 	if err != nil {
@@ -615,8 +728,8 @@ func (r *WaterRenderer) createResources() error {
 		Label: "water spectral vector evolution bind group layout",
 		Entries: []wgpu.BindGroupLayoutEntry{
 			uniformLayoutEntry(wgpu.ShaderStageCompute),
-			sampledFloatTextureLayoutEntry(1, wgpu.ShaderStageCompute),
-			writeRGBA32StorageTextureLayoutEntry(2, wgpu.ShaderStageCompute),
+			sampledFilterableFloatTextureLayoutEntry(1, wgpu.ShaderStageCompute),
+			writeFloatStorageTextureLayoutEntry(2, wgpu.ShaderStageCompute, gputypes.TextureFormatRGBA16Float),
 			writeRGBA32StorageTextureLayoutEntry(3, wgpu.ShaderStageCompute),
 		},
 	})
@@ -918,23 +1031,6 @@ func (r *WaterRenderer) createResources() error {
 		return fmt.Errorf("create interaction B-to-A group: %w", err)
 	}
 
-	r.renderBindGroupAA, err = r.createRenderBindGroup("water render foam A interaction A", r.foamHistoryViewA, r.interactionViewA)
-	if err != nil {
-		return fmt.Errorf("create water render bind group AA: %w", err)
-	}
-	r.renderBindGroupAB, err = r.createRenderBindGroup("water render foam A interaction B", r.foamHistoryViewA, r.interactionViewB)
-	if err != nil {
-		return fmt.Errorf("create water render bind group AB: %w", err)
-	}
-	r.renderBindGroupBA, err = r.createRenderBindGroup("water render foam B interaction A", r.foamHistoryViewB, r.interactionViewA)
-	if err != nil {
-		return fmt.Errorf("create water render bind group BA: %w", err)
-	}
-	r.renderBindGroupBB, err = r.createRenderBindGroup("water render foam B interaction B", r.foamHistoryViewB, r.interactionViewB)
-	if err != nil {
-		return fmt.Errorf("create water render bind group BB: %w", err)
-	}
-
 	r.skyBindGroup, err = r.device.CreateBindGroup(&wgpu.BindGroupDescriptor{
 		Label:  "skybox render bind group",
 		Layout: r.skyBindGroupLayout,
@@ -1135,6 +1231,7 @@ func (r *WaterRenderer) createSkyPipeline(sampleCount uint32) (*wgpu.RenderPipel
 }
 
 func (r *WaterRenderer) createWaterPipeline(sampleCount uint32) (*wgpu.RenderPipeline, error) {
+	blend := gputypes.BlendStateAlpha()
 	pipeline, err := r.device.CreateRenderPipeline(&wgpu.RenderPipelineDescriptor{
 		Label:  fmt.Sprintf("water projected-grid pipeline %dx", sampleCount),
 		Layout: r.renderPipelineLayout,
@@ -1154,6 +1251,7 @@ func (r *WaterRenderer) createWaterPipeline(sampleCount uint32) (*wgpu.RenderPip
 			Targets: []wgpu.ColorTargetState{
 				{
 					Format:    r.surfaceFormat,
+					Blend:     &blend,
 					WriteMask: gputypes.ColorWriteMaskAll,
 				},
 			},
@@ -1214,6 +1312,9 @@ func (r *WaterRenderer) createRenderBindGroup(label string, foamHistory, interac
 			{Binding: 5, TextureView: foamHistory},
 			{Binding: 6, TextureView: r.variationView},
 			{Binding: 7, TextureView: interaction},
+			{Binding: 8, TextureView: r.reflectionView},
+			{Binding: 9, TextureView: r.shadowView},
+			{Binding: 10, Sampler: r.interactionSampler},
 		},
 	})
 }
@@ -1280,67 +1381,160 @@ func (r *WaterRenderer) ensureRenderTargets(width, height uint32) error {
 	if r.shipAA {
 		samples = 4
 	}
-	if r.shipDepthView != nil && r.shipDepthWidth == width && r.shipDepthHeight == height && r.shipDepthSamples == samples {
-		return nil
-	}
-	releaseTextureView(&r.shipDepthView)
-	releaseTexture(&r.shipDepthTexture)
-	releaseTextureView(&r.msaaColorView)
-	releaseTexture(&r.msaaColorTexture)
+	if r.shipDepthView == nil || r.shipDepthWidth != width || r.shipDepthHeight != height || r.shipDepthSamples != samples {
+		releaseTextureView(&r.shipDepthView)
+		releaseTexture(&r.shipDepthTexture)
+		releaseTextureView(&r.msaaColorView)
+		releaseTexture(&r.msaaColorTexture)
 
-	tex, err := r.device.CreateTexture(&wgpu.TextureDescriptor{
-		Label:         "ship depth texture",
-		Size:          wgpu.Extent3D{Width: width, Height: height, DepthOrArrayLayers: 1},
-		MipLevelCount: 1,
-		SampleCount:   samples,
-		Dimension:     wgpu.TextureDimension2D,
-		Format:        shipDepthFormat,
-		Usage:         wgpu.TextureUsageRenderAttachment,
-	})
-	if err != nil {
-		return fmt.Errorf("create ship depth texture: %w", err)
-	}
-	view, err := r.device.CreateTextureView(tex, &wgpu.TextureViewDescriptor{
-		Label:           "ship depth view",
-		Format:          shipDepthFormat,
-		Dimension:       gputypes.TextureViewDimension2D,
-		Aspect:          gputypes.TextureAspectAll,
-		BaseMipLevel:    0,
-		MipLevelCount:   1,
-		BaseArrayLayer:  0,
-		ArrayLayerCount: 1,
-	})
-	if err != nil {
-		tex.Release()
-		return fmt.Errorf("create ship depth view: %w", err)
-	}
-	r.shipDepthTexture = tex
-	r.shipDepthView = view
-	r.shipDepthWidth = width
-	r.shipDepthHeight = height
-	r.shipDepthSamples = samples
-
-	if samples > 1 {
-		r.msaaColorTexture, err = r.device.CreateTexture(&wgpu.TextureDescriptor{
-			Label:         "water MSAA color texture",
-			Size:          wgpu.Extent3D{Width: width, Height: height, DepthOrArrayLayers: 1},
-			MipLevelCount: 1,
-			SampleCount:   samples,
-			Dimension:     wgpu.TextureDimension2D,
-			Format:        r.surfaceFormat,
-			Usage:         wgpu.TextureUsageRenderAttachment,
+		tex, err := r.device.CreateTexture(&wgpu.TextureDescriptor{
+			Label: "ship depth texture", Size: wgpu.Extent3D{Width: width, Height: height, DepthOrArrayLayers: 1},
+			MipLevelCount: 1, SampleCount: samples, Dimension: wgpu.TextureDimension2D,
+			Format: shipDepthFormat, Usage: wgpu.TextureUsageRenderAttachment,
 		})
 		if err != nil {
-			return fmt.Errorf("create water MSAA color texture: %w", err)
+			return fmt.Errorf("create ship depth texture: %w", err)
 		}
-		r.msaaColorView, err = r.device.CreateTextureView(r.msaaColorTexture, nil)
+		view, err := r.device.CreateTextureView(tex, nil)
 		if err != nil {
-			return fmt.Errorf("create water MSAA color view: %w", err)
+			tex.Release()
+			return fmt.Errorf("create ship depth view: %w", err)
 		}
-		r.msaaColorWidth = width
-		r.msaaColorHeight = height
+		r.shipDepthTexture, r.shipDepthView = tex, view
+		r.shipDepthWidth, r.shipDepthHeight, r.shipDepthSamples = width, height, samples
+
+		if samples > 1 {
+			r.msaaColorTexture, err = r.device.CreateTexture(&wgpu.TextureDescriptor{
+				Label: "water MSAA color texture", Size: wgpu.Extent3D{Width: width, Height: height, DepthOrArrayLayers: 1},
+				MipLevelCount: 1, SampleCount: samples, Dimension: wgpu.TextureDimension2D,
+				Format: r.surfaceFormat, Usage: wgpu.TextureUsageRenderAttachment,
+			})
+			if err != nil {
+				return fmt.Errorf("create water MSAA color texture: %w", err)
+			}
+			r.msaaColorView, err = r.device.CreateTextureView(r.msaaColorTexture, nil)
+			if err != nil {
+				return fmt.Errorf("create water MSAA color view: %w", err)
+			}
+			r.msaaColorWidth, r.msaaColorHeight = width, height
+		}
+	}
+
+	reflectionWidth, reflectionHeight := uint32(1), uint32(1)
+	switch r.shipReflections {
+	case ShipReflectionLow:
+		reflectionWidth, reflectionHeight = max(width/4, 1), max(height/4, 1)
+	case ShipReflectionMedium:
+		reflectionWidth, reflectionHeight = max(width/2, 1), max(height/2, 1)
+	case ShipReflectionHigh:
+		reflectionWidth, reflectionHeight = width, height
+	}
+	shadowWidth, shadowHeight := uint32(1), uint32(1)
+	if r.shipShadows {
+		shadowWidth, shadowHeight = max(width/2, 1), max(height/2, 1)
+	}
+	targetsChanged := r.reflectionView == nil || r.shadowView == nil ||
+		r.reflectionWidth != reflectionWidth || r.reflectionHeight != reflectionHeight ||
+		r.shadowWidth != shadowWidth || r.shadowHeight != shadowHeight
+	if targetsChanged {
+		r.releaseWaterRenderBindGroups()
+		r.releaseShipEffectTargets()
+
+		var err error
+		r.reflectionTexture, r.reflectionView, r.reflectionDepthTexture, r.reflectionDepthView, err =
+			r.createShipEffectTarget("ship reflection", reflectionWidth, reflectionHeight)
+		if err != nil {
+			return err
+		}
+		r.reflectionWidth, r.reflectionHeight = reflectionWidth, reflectionHeight
+
+		r.shadowTexture, r.shadowView, r.shadowDepthTexture, r.shadowDepthView, err =
+			r.createShipEffectTarget("ship shadow", shadowWidth, shadowHeight)
+		if err != nil {
+			return err
+		}
+		r.shadowWidth, r.shadowHeight = shadowWidth, shadowHeight
+	}
+	if r.renderBindGroupAA == nil {
+		if err := r.rebuildWaterRenderBindGroups(); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func (r *WaterRenderer) createShipEffectTarget(label string, width, height uint32) (*wgpu.Texture, *wgpu.TextureView, *wgpu.Texture, *wgpu.TextureView, error) {
+	color, err := r.device.CreateTexture(&wgpu.TextureDescriptor{
+		Label: label + " color texture", Size: wgpu.Extent3D{Width: width, Height: height, DepthOrArrayLayers: 1},
+		MipLevelCount: 1, SampleCount: 1, Dimension: wgpu.TextureDimension2D, Format: shipEffectFormat,
+		Usage: wgpu.TextureUsageRenderAttachment | wgpu.TextureUsageTextureBinding,
+	})
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("create %s color texture: %w", label, err)
+	}
+	colorView, err := r.device.CreateTextureView(color, nil)
+	if err != nil {
+		color.Release()
+		return nil, nil, nil, nil, fmt.Errorf("create %s color view: %w", label, err)
+	}
+	depth, err := r.device.CreateTexture(&wgpu.TextureDescriptor{
+		Label: label + " depth texture", Size: wgpu.Extent3D{Width: width, Height: height, DepthOrArrayLayers: 1},
+		MipLevelCount: 1, SampleCount: 1, Dimension: wgpu.TextureDimension2D, Format: shipDepthFormat,
+		Usage: wgpu.TextureUsageRenderAttachment,
+	})
+	if err != nil {
+		colorView.Release()
+		color.Release()
+		return nil, nil, nil, nil, fmt.Errorf("create %s depth texture: %w", label, err)
+	}
+	depthView, err := r.device.CreateTextureView(depth, nil)
+	if err != nil {
+		depth.Release()
+		colorView.Release()
+		color.Release()
+		return nil, nil, nil, nil, fmt.Errorf("create %s depth view: %w", label, err)
+	}
+	return color, colorView, depth, depthView, nil
+}
+
+func (r *WaterRenderer) rebuildWaterRenderBindGroups() error {
+	r.releaseWaterRenderBindGroups()
+	var err error
+	r.renderBindGroupAA, err = r.createRenderBindGroup("water render foam A interaction A", r.foamHistoryViewA, r.interactionViewA)
+	if err != nil {
+		return fmt.Errorf("create water render bind group AA: %w", err)
+	}
+	r.renderBindGroupAB, err = r.createRenderBindGroup("water render foam A interaction B", r.foamHistoryViewA, r.interactionViewB)
+	if err != nil {
+		return fmt.Errorf("create water render bind group AB: %w", err)
+	}
+	r.renderBindGroupBA, err = r.createRenderBindGroup("water render foam B interaction A", r.foamHistoryViewB, r.interactionViewA)
+	if err != nil {
+		return fmt.Errorf("create water render bind group BA: %w", err)
+	}
+	r.renderBindGroupBB, err = r.createRenderBindGroup("water render foam B interaction B", r.foamHistoryViewB, r.interactionViewB)
+	if err != nil {
+		return fmt.Errorf("create water render bind group BB: %w", err)
+	}
+	return nil
+}
+
+func (r *WaterRenderer) releaseWaterRenderBindGroups() {
+	releaseBindGroup(&r.renderBindGroupBB)
+	releaseBindGroup(&r.renderBindGroupBA)
+	releaseBindGroup(&r.renderBindGroupAB)
+	releaseBindGroup(&r.renderBindGroupAA)
+}
+
+func (r *WaterRenderer) releaseShipEffectTargets() {
+	releaseTextureView(&r.reflectionDepthView)
+	releaseTexture(&r.reflectionDepthTexture)
+	releaseTextureView(&r.reflectionView)
+	releaseTexture(&r.reflectionTexture)
+	releaseTextureView(&r.shadowDepthView)
+	releaseTexture(&r.shadowDepthTexture)
+	releaseTextureView(&r.shadowView)
+	releaseTexture(&r.shadowTexture)
 }
 
 func selectResolveTarget(enabled bool, target *wgpu.TextureView) *wgpu.TextureView {
@@ -1382,22 +1576,31 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 
 	r.shipRenderer.UpdateMotion(frame.Time)
 	originX, originZ := interactionFieldOrigin(r.shipRenderer)
+	interactionDT := frame.Time - r.interactionLastTime
+	runInteraction := !r.interactionInitialized || interactionDT >= waterInteractionStep
+	if !runInteraction {
+		// The texture remains expressed in the last simulated field coordinates.
+		originX, originZ = r.interactionOriginX, r.interactionOriginZ
+	}
 	frame.InteractionOriginX = originX
 	frame.InteractionOriginZ = originZ
 	uniformBytes := packWaterFrame(frame)
 	if err := queue.WriteBuffer(r.uniformBuffer, 0, uniformBytes); err != nil {
 		return fmt.Errorf("write water uniforms: %w", err)
 	}
-	dt := frame.Time - r.interactionLastTime
-	if dt <= 0 || dt > 0.10 {
-		dt = 1.0 / 60.0
+	if !r.interactionInitialized || interactionDT <= 0 {
+		interactionDT = 0
+	} else if interactionDT > 0.10 {
+		interactionDT = 0.10
 	}
 	prevX, prevZ := r.interactionOriginX, r.interactionOriginZ
 	if !r.interactionInitialized {
 		prevX, prevZ = originX+waterInteractionSpan*4, originZ+waterInteractionSpan*4
 	}
-	if err := queue.WriteBuffer(r.interactionUniformBuffer, 0, packInteractionFrame(r.shipRenderer, originX, originZ, prevX, prevZ, frame.Time, dt)); err != nil {
-		return fmt.Errorf("write water interaction uniforms: %w", err)
+	if runInteraction {
+		if err := queue.WriteBuffer(r.interactionUniformBuffer, 0, packInteractionFrame(r.shipRenderer, originX, originZ, prevX, prevZ, frame.Time, interactionDT)); err != nil {
+			return fmt.Errorf("write water interaction uniforms: %w", err)
+		}
 	}
 
 	encoder, err := r.device.CreateCommandEncoder(&wgpu.CommandEncoderDescriptor{
@@ -1480,16 +1683,64 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 		encoder.DiscardEncoding()
 		return err
 	}
-	interactionGroup := r.interactionAToBGroup
-	renderInteractionB := true
-	if r.interactionFlip {
-		interactionGroup = r.interactionBToAGroup
-		renderInteractionB = false
+	renderInteractionB := r.interactionFlip
+	if runInteraction {
+		interactionGroup := r.interactionAToBGroup
+		renderInteractionB = true
+		if r.interactionFlip {
+			interactionGroup = r.interactionBToAGroup
+			renderInteractionB = false
+		}
+		if err = dispatchWaterComputePass(encoder, "water ship interaction pass", r.interactionPipeline, interactionGroup, (waterInteractionSize+7)/8, (waterInteractionSize+7)/8, 1); err != nil {
+			encoder.DiscardEncoding()
+			return err
+		}
 	}
-	if err = dispatchWaterComputePass(encoder, "water ship interaction pass", r.interactionPipeline, interactionGroup, (waterInteractionSize+7)/8, (waterInteractionSize+7)/8, 1); err != nil {
+
+	reflectionPass, err := encoder.BeginRenderPass(&wgpu.RenderPassDescriptor{
+		Label: "ship planar reflection pass",
+		ColorAttachments: []wgpu.RenderPassColorAttachment{{
+			View: r.reflectionView, LoadOp: gputypes.LoadOpClear, StoreOp: gputypes.StoreOpStore,
+			ClearValue: gputypes.Color{R: 0, G: 0, B: 0, A: 0},
+		}},
+		DepthStencilAttachment: &wgpu.RenderPassDepthStencilAttachment{
+			View: r.reflectionDepthView, DepthLoadOp: gputypes.LoadOpClear, DepthStoreOp: gputypes.StoreOpDiscard, DepthClearValue: 1.0,
+		},
+	})
+	if err != nil {
 		encoder.DiscardEncoding()
-		return err
+		return fmt.Errorf("begin ship reflection pass: %w", err)
 	}
+	if r.shipReflections != ShipReflectionOff {
+		r.shipRenderer.DrawReflection(reflectionPass, frame)
+	}
+	if err = reflectionPass.End(); err != nil {
+		encoder.DiscardEncoding()
+		return fmt.Errorf("end ship reflection pass: %w", err)
+	}
+
+	shadowPass, err := encoder.BeginRenderPass(&wgpu.RenderPassDescriptor{
+		Label: "ship projected shadow pass",
+		ColorAttachments: []wgpu.RenderPassColorAttachment{{
+			View: r.shadowView, LoadOp: gputypes.LoadOpClear, StoreOp: gputypes.StoreOpStore,
+			ClearValue: gputypes.Color{R: 0, G: 0, B: 0, A: 0},
+		}},
+		DepthStencilAttachment: &wgpu.RenderPassDepthStencilAttachment{
+			View: r.shadowDepthView, DepthLoadOp: gputypes.LoadOpClear, DepthStoreOp: gputypes.StoreOpDiscard, DepthClearValue: 1.0,
+		},
+	})
+	if err != nil {
+		encoder.DiscardEncoding()
+		return fmt.Errorf("begin ship shadow pass: %w", err)
+	}
+	if r.shipShadows {
+		r.shipRenderer.DrawShadow(shadowPass, frame)
+	}
+	if err = shadowPass.End(); err != nil {
+		encoder.DiscardEncoding()
+		return fmt.Errorf("end ship shadow pass: %w", err)
+	}
+
 	renderBindGroup := r.renderBindGroupAA
 	if renderFoamB && renderInteractionB {
 		renderBindGroup = r.renderBindGroupBB
@@ -1584,10 +1835,12 @@ func (r *WaterRenderer) Draw(target *wgpu.TextureView, frame WaterFrame) error {
 	}
 	r.foamHistoryInitialized = true
 	r.foamHistoryFlip = !r.foamHistoryFlip
-	r.interactionInitialized = true
-	r.interactionFlip = !r.interactionFlip
-	r.interactionOriginX, r.interactionOriginZ = originX, originZ
-	r.interactionLastTime = frame.Time
+	if runInteraction {
+		r.interactionInitialized = true
+		r.interactionFlip = !r.interactionFlip
+		r.interactionOriginX, r.interactionOriginZ = originX, originZ
+		r.interactionLastTime = frame.Time
+	}
 
 	return nil
 }
@@ -1753,8 +2006,9 @@ func interactionFieldOrigin(renderer *ShipRenderer) (float32, float32) {
 		forwardX /= forwardLength
 		forwardZ /= forwardLength
 	}
-	// Bias the field behind the fleet so long propeller and Kelvin wakes retain
-	// resolution instead of spending half the texture in front of the bows.
+	// Bias storage behind the fleet so the persistent field retains more of the
+	// path already traveled. The shader only injects at each ship's current
+	// hull/stern; this offset does not procedurally invent wake history.
 	centerX -= forwardX * waterInteractionSpan * 0.20
 	centerZ -= forwardZ * waterInteractionSpan * 0.20
 	texel := waterInteractionSpan / float32(waterInteractionSize)
@@ -1889,6 +2143,7 @@ func (r *WaterRenderer) Release() {
 	releaseBindGroup(&r.renderBindGroupBA)
 	releaseBindGroup(&r.renderBindGroupAB)
 	releaseBindGroup(&r.renderBindGroupAA)
+	r.releaseShipEffectTargets()
 	releaseBindGroup(&r.skyBindGroup)
 	releaseBindGroup(&r.variationBindGroup)
 	releaseBindGroup(&r.interactionBToAGroup)
@@ -1937,6 +2192,10 @@ func (r *WaterRenderer) Release() {
 	releaseTexture(&r.interactionTextureB)
 	releaseTextureView(&r.interactionViewA)
 	releaseTexture(&r.interactionTextureA)
+	if r.interactionSampler != nil {
+		r.interactionSampler.Release()
+		r.interactionSampler = nil
+	}
 	releaseTextureView(&r.foamHistoryViewB)
 	releaseTexture(&r.foamHistoryTextureB)
 	releaseTextureView(&r.foamHistoryViewA)

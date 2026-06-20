@@ -128,12 +128,14 @@ type ShipRenderer struct {
 	device *wgpu.Device
 	queue  *wgpu.Queue
 
-	shaderModule   *wgpu.ShaderModule
-	pipeline       *wgpu.RenderPipeline
-	pipelineMSAA   *wgpu.RenderPipeline
-	pipelineLayout *wgpu.PipelineLayout
-	uniformLayout  *wgpu.BindGroupLayout
-	materialLayout *wgpu.BindGroupLayout
+	shaderModule       *wgpu.ShaderModule
+	pipeline           *wgpu.RenderPipeline
+	pipelineMSAA       *wgpu.RenderPipeline
+	reflectionPipeline *wgpu.RenderPipeline
+	shadowPipeline     *wgpu.RenderPipeline
+	pipelineLayout     *wgpu.PipelineLayout
+	uniformLayout      *wgpu.BindGroupLayout
+	materialLayout     *wgpu.BindGroupLayout
 
 	sampler *wgpu.Sampler
 	models  []shipModelGPU
@@ -245,6 +247,14 @@ func (r *ShipRenderer) createResources(surfaceFormat wgpu.TextureFormat, cpuMode
 	if err != nil {
 		return err
 	}
+	r.reflectionPipeline, err = r.createEffectPipeline("ship reflection pipeline", "vs_reflection", "fs_reflection", gputypes.CullModeNone)
+	if err != nil {
+		return err
+	}
+	r.shadowPipeline, err = r.createEffectPipeline("ship shadow pipeline", "vs_shadow", "fs_shadow", gputypes.CullModeNone)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -324,6 +334,32 @@ func (r *ShipRenderer) createPipeline(surfaceFormat wgpu.TextureFormat, sampleCo
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create ship %dx pipeline: %w", sampleCount, err)
+	}
+	return pipeline, nil
+}
+
+func (r *ShipRenderer) createEffectPipeline(label, vertexEntry, fragmentEntry string, cullMode wgpu.CullMode) (*wgpu.RenderPipeline, error) {
+	pipeline, err := r.device.CreateRenderPipeline(&wgpu.RenderPipelineDescriptor{
+		Label:  label,
+		Layout: r.pipelineLayout,
+		Vertex: wgpu.VertexState{
+			Module: r.shaderModule, EntryPoint: vertexEntry,
+			Buffers: []gputypes.VertexBufferLayout{{ArrayStride: 32, StepMode: gputypes.VertexStepModeVertex, Attributes: []gputypes.VertexAttribute{
+				{Format: gputypes.VertexFormatFloat32x3, Offset: 0, ShaderLocation: 0},
+				{Format: gputypes.VertexFormatFloat32x3, Offset: 12, ShaderLocation: 1},
+				{Format: gputypes.VertexFormatFloat32x2, Offset: 24, ShaderLocation: 2},
+			}}},
+		},
+		Primitive:    wgpu.PrimitiveState{Topology: gputypes.PrimitiveTopologyTriangleList, FrontFace: gputypes.FrontFaceCCW, CullMode: cullMode},
+		DepthStencil: &wgpu.DepthStencilState{Format: shipDepthFormat, DepthWriteEnabled: true, DepthCompare: gputypes.CompareFunctionLess},
+		Multisample:  gputypes.MultisampleState{Count: 1, Mask: 0xFFFFFFFF},
+		Fragment: &wgpu.FragmentState{
+			Module: r.shaderModule, EntryPoint: fragmentEntry,
+			Targets: []wgpu.ColorTargetState{{Format: gputypes.TextureFormatRGBA8Unorm, WriteMask: gputypes.ColorWriteMaskAll}},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create %s: %w", label, err)
 	}
 	return pipeline, nil
 }
@@ -423,6 +459,27 @@ func (r *ShipRenderer) Draw(pass *wgpu.RenderPassEncoder, frame WaterFrame, mult
 	pipeline := r.pipeline
 	if multisampled {
 		pipeline = r.pipelineMSAA
+	}
+	r.drawWithPipeline(pass, frame, pipeline)
+}
+
+func (r *ShipRenderer) DrawReflection(pass *wgpu.RenderPassEncoder, frame WaterFrame) {
+	if r == nil {
+		return
+	}
+	r.drawWithPipeline(pass, frame, r.reflectionPipeline)
+}
+
+func (r *ShipRenderer) DrawShadow(pass *wgpu.RenderPassEncoder, frame WaterFrame) {
+	if r == nil {
+		return
+	}
+	r.drawWithPipeline(pass, frame, r.shadowPipeline)
+}
+
+func (r *ShipRenderer) drawWithPipeline(pass *wgpu.RenderPassEncoder, frame WaterFrame, pipeline *wgpu.RenderPipeline) {
+	if r == nil || pass == nil || pipeline == nil || len(r.models) == 0 || len(r.ships) == 0 {
+		return
 	}
 	pass.SetPipeline(pipeline)
 	for i := range r.ships {
@@ -567,6 +624,14 @@ func (r *ShipRenderer) Release() {
 	if r.pipelineMSAA != nil {
 		r.pipelineMSAA.Release()
 		r.pipelineMSAA = nil
+	}
+	if r.reflectionPipeline != nil {
+		r.reflectionPipeline.Release()
+		r.reflectionPipeline = nil
+	}
+	if r.shadowPipeline != nil {
+		r.shadowPipeline.Release()
+		r.shadowPipeline = nil
 	}
 	if r.pipelineLayout != nil {
 		r.pipelineLayout.Release()

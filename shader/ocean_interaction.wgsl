@@ -20,9 +20,7 @@ var<uniform> wake: WakeUniforms;
 @group(0) @binding(1)
 var previous_field: texture_2d<f32>;
 @group(0) @binding(2)
-var output_field: texture_storage_2d<rgba32float, write>;
-
-const TAU: f32 = 6.28318530718;
+var output_field: texture_storage_2d<rgba16float, write>;
 
 fn finite_or(v: f32, fallback: f32, limit: f32) -> f32 {
     let good = (v == v) && abs(v) <= limit;
@@ -64,7 +62,11 @@ fn gaussian(x: f32) -> f32 {
     return exp(-x * x);
 }
 
-fn add_ship_wake(world: vec2<f32>, ship: WakeShip, time: f32) -> vec4<f32> {
+// Generate only the disturbance touching the ship this frame. The persistent
+// ping-pong field is the wake trail; procedurally drawing an imagined trail
+// behind the ship every frame makes stationary ships continuously create foam
+// and repeatedly reinforces the same straight stripe.
+fn ship_disturbance(world: vec2<f32>, ship: WakeShip) -> vec4<f32> {
     let forward = normalize(ship.dir_size.xy + vec2<f32>(0.0001));
     let right = vec2<f32>(forward.y, -forward.x);
     let rel = world - ship.pos_speed.xy;
@@ -72,56 +74,70 @@ fn add_ship_wake(world: vec2<f32>, ship: WakeShip, time: f32) -> vec4<f32> {
     let lateral = dot(rel, right);
     let ship_length = max(ship.dir_size.z, 20.0);
     let beam = max(ship.dir_size.w, ship_length * 0.10);
-    let speed = max(ship.pos_speed.z, 0.0);
-    let strength = ship.pos_speed.w * smoothstep(0.5, 8.0, speed);
-    let stern = -ship_length * 0.42;
-    let behind = max(-(along - stern), 0.0);
-    let wake_gate = select(0.0, exp(-behind / max(ship_length * 4.8, 1.0)), along < stern);
+    let speed = abs(ship.pos_speed.z);
+    let moving = smoothstep(0.20, 2.0, speed);
+    let strength = max(ship.pos_speed.w, 0.0) * moving;
+    if strength <= 0.0001 {
+        return vec4<f32>(0.0);
+    }
 
-    // Bow pressure and diverging hull shoulders.
-    let bow_rel = vec2<f32>((along - ship_length * 0.47) / max(ship_length * 0.11, 1.0), lateral / max(beam * 0.42, 1.0));
-    let bow = gaussian(length(bow_rel)) * strength;
-    let side_along = abs(along) / max(ship_length * 0.48, 1.0);
-    let side_band = gaussian((abs(lateral) - beam * 0.48) / max(beam * 0.15, 0.5)) *
-                    (1.0 - smoothstep(0.72, 1.08, side_along)) * strength;
+    let half_length = ship_length * 0.5;
+    let longitudinal = along / max(half_length, 1.0);
+    let hull_gate = 1.0 - smoothstep(0.82, 1.04, abs(longitudinal));
+    let taper = sqrt(max(1.0 - longitudinal * longitudinal, 0.0));
+    let half_beam = max(beam * 0.5 * taper, beam * 0.10);
 
-    // Persistent propeller wash widens and loses coherence downstream.
-    let trail_width = beam * (0.08 + behind / max(ship_length, 1.0) * 0.050);
-    let prop = gaussian(lateral / max(trail_width, 0.75)) * wake_gate * strength;
-    let prop_phase = behind * 0.19 - time * (2.1 + speed * 0.035) + ship.params.z;
-    let prop_break = 0.36 + 0.64 * pow(0.5 + 0.5 * sin(prop_phase), 1.7);
-    let prop_foam = prop * prop_break;
-    let shaft_offset = beam * 0.13;
-    let shaft_width = 0.8 + behind * 0.006;
-    let shaft_tracks = (
+    // A narrow pressure ridge follows the actual waterline. Bow pressure is a
+    // local stamp, not a generated train of waves extending into the past.
+    let side_distance = (abs(lateral) - half_beam) / max(beam * 0.12, 0.8);
+    let shoulders = gaussian(side_distance) * hull_gate * strength;
+    let bow = gaussian((along - half_length * 0.90) / max(ship_length * 0.085, 1.5)) *
+              gaussian(lateral / max(beam * 0.42, 1.0)) * strength;
+
+    // Propeller wash is injected in a compact patch at and immediately behind
+    // the stern. As the ship advances, old patches remain in previous_field and
+    // naturally form the trail.
+    let stern_center = -half_length * 0.98;
+    let stern_along = (along - stern_center) / max(ship_length * 0.045, 1.5);
+    let propeller_scale = clamp(ship.params.y / 4.0, 0.45, 1.25);
+    let shaft_offset = beam * mix(0.10, 0.18, propeller_scale);
+    // Keep each shaft at least half an interaction texel wide. Narrower stamps
+    // flicker between texels and disappear at normal camera distances.
+    let shaft_width = max(beam * 0.085, 3.4);
+    let shaft_wash = (
         gaussian((lateral - shaft_offset) / shaft_width) +
         gaussian((lateral + shaft_offset) / shaft_width)
-    ) * wake_gate * strength;
-    let shaft_pulse = 0.28 + 0.72 * pow(0.5 + 0.5 * sin(prop_phase * 1.37 + lateral * 0.12), 2.0);
-
-    // Kelvin arms at the deep-water half-angle (~19.47 degrees).
-    let arm_center = behind * 0.354;
-    let arm_width = beam * 0.20 + behind * 0.020;
-    let arm_dist = min(abs(lateral - arm_center), abs(lateral + arm_center));
-    let arm = gaussian(arm_dist / max(arm_width, 0.8)) * wake_gate * strength;
-    let wavelength = max(10.0, speed * speed / 9.81 * 0.72);
-    let phase = TAU * behind / wavelength - time * (1.0 + speed * 0.055) + ship.params.z;
-    let kelvin_height = sin(phase) * arm * 0.20;
-    let kelvin_slope = cos(phase) * arm * (TAU / wavelength) * 0.20;
-    let arm_sign = select(-1.0, 1.0, lateral >= 0.0);
-    let arm_dir = normalize(-forward + right * arm_sign * 0.354);
-
-    var result = vec4<f32>(0.0);
-    let slope = -forward * bow * 0.045 +
-                right * sign(lateral) * side_band * 0.025 +
-                arm_dir * kelvin_slope;
-    result = vec4<f32>(
-        slope,
-        bow * 0.08 + kelvin_height,
-        bow * 0.07 + side_band * 0.11 + prop_foam * 0.38 +
-        shaft_tracks * shaft_pulse * 0.31 + arm * 0.065
+    ) * 0.5;
+    let center_wash = gaussian(lateral / max(beam * 0.20, 3.8));
+    let wake_phase = sin(dot(world, vec2<f32>(0.115, -0.073)) + ship.params.z) *
+                     sin(dot(world, vec2<f32>(-0.047, 0.139)) - ship.params.z * 1.7);
+    let spatial_breakup = 0.46 + 0.54 * smoothstep(
+        -0.25,
+        0.72,
+        wake_phase
     );
-    return result;
+    let wash = gaussian(stern_along) *
+               (shaft_wash * 0.78 + center_wash * 0.22) *
+               spatial_breakup * strength;
+
+    let speed_energy = clamp(speed / 15.0, 0.15, 1.4);
+    let outward = select(-1.0, 1.0, lateral >= 0.0);
+    let churn = sin(dot(world, vec2<f32>(0.19, 0.11)) + ship.params.z * 2.3);
+    // Preserve a coherent outward component in the stern disturbance. The
+    // simulation uses this vector to spread old propeller wash laterally;
+    // without it every deposited patch remains a constant-width paint stripe.
+    let wash_flow = right * outward * wash *
+                    (0.060 + speed_energy * 0.026) *
+                    (0.78 + churn * 0.22);
+    let slope = -forward * bow * (0.044 + speed_energy * 0.018) +
+                right * outward * shoulders * 0.026 +
+                wash_flow;
+    let height = bow * 0.068 + wash * (-0.028 + wake_phase * 0.021);
+    // Do not fill the whole hull shoulder with foam. That creates a bright
+    // ship-sized capsule at distance. Bow aeration stays compact; sustained
+    // foam is deposited only by stern wash.
+    let foam = wash * (0.28 + speed_energy * 0.18);
+    return vec4<f32>(slope, height, foam);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -134,18 +150,53 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5)) / vec2<f32>(dims_u);
     let world = wake.field.xy + uv * wake.field.z;
     let dt = clamp(wake.field.w, 0.0, 0.10);
-    let time = wake.previous_time_count.z;
+    let texel_world = wake.field.z / max(f32(dims.x), 1.0);
 
-    var value = sample_previous(world, dims);
-    value = vec4<f32>(
-        value.xy * exp(-dt * 1.75),
-        value.z * exp(-dt * 1.45),
-        value.w * exp(-dt * 0.48)
+    // WoWS' local simulation uses a damped neighborhood update. This is a
+    // deliberately small version of that idea: preserve world-space history,
+    // let it spread by a fraction of a texel, and damp displacement faster than
+    // foam. No new disturbance appears when dt is zero.
+    let center = sample_previous(world, dims);
+    let east = sample_previous(world + vec2<f32>(texel_world, 0.0), dims);
+    let west = sample_previous(world - vec2<f32>(texel_world, 0.0), dims);
+    let north = sample_previous(world + vec2<f32>(0.0, texel_world), dims);
+    let south = sample_previous(world - vec2<f32>(0.0, texel_world), dims);
+    let neighbors = (east + west + north + south) * 0.25;
+
+    // Conservative four-neighbour transport turns the coherent stern slope
+    // into slow lateral wash spreading. This widens older wake sections into
+    // a V without generating any disturbance away from previously deposited
+    // ship interaction.
+    let incoming_foam =
+        max(-east.x, 0.0) * east.w +
+        max( west.x, 0.0) * west.w +
+        max(-north.y, 0.0) * north.w +
+        max( south.y, 0.0) * south.w;
+    let outgoing_foam = (
+        max( center.x, 0.0) + max(-center.x, 0.0) +
+        max( center.y, 0.0) + max(-center.y, 0.0)
+    ) * center.w;
+    let foam_transport = (incoming_foam - outgoing_foam) *
+                         clamp(dt * 28.0, 0.0, 0.22);
+    let transported_foam = max(center.w + foam_transport, 0.0);
+    var value = vec4<f32>(
+        mix(center.xy, neighbors.xy, clamp(dt * 0.30, 0.0, 0.05)) * exp(-dt * 0.16),
+        mix(center.z, neighbors.z, clamp(dt * 0.22, 0.0, 0.04)) * exp(-dt * 0.11),
+        // Keep old wash directional. Excess isotropic diffusion was turning a
+        // long-lived trail back into a widening cloud.
+        // Roughly 12.6s half-life: long enough to read as a wake, short enough
+        // for old tracks to visibly disappear.
+        mix(transported_foam, neighbors.w, clamp(dt * 0.018, 0.0, 0.006)) * exp(-dt * 0.055)
     );
 
     let ship_count = min(i32(wake.previous_time_count.w + 0.5), 4);
     for (var i = 0; i < ship_count; i = i + 1) {
-        value += add_ship_wake(world, wake.ships[i], time) * dt * 1.35;
+        let source = ship_disturbance(world, wake.ships[i]);
+        value = vec4<f32>(
+            value.xy + source.xy * dt * 1.20,
+            value.z + source.z * dt * 1.00,
+            value.w + source.w * dt * 1.00 * (1.0 - value.w)
+        );
     }
 
     // Non-wrapping circular boundary fade.

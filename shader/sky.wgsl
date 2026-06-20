@@ -81,6 +81,23 @@ fn fs_main(in: SkyOut) -> @location(0) vec4<f32> {
     // Reconstruct after interpolation. Interpolating normalized corner rays
     // makes the sky bend and slide incorrectly during camera rotation.
     let dir = camera_ray_from_ndc(in.ndc);
+    let camera_depth = frame.camera_forward_water.w - frame.camera_pos_fov.y;
+    if camera_depth > 0.0 {
+        let upward = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+        let depth_fade = smoothstep(18.0, 250.0, camera_depth);
+        let shallow_light = exp(-camera_depth * 0.011);
+        let horizontal_fog = 1.0 - exp(-max(1.0 - abs(dir.y), 0.0) * (0.30 + camera_depth * 0.006));
+        let caustic_phase = dot(dir.xz, vec2<f32>(19.0, -14.0)) + frame.resolution_time_grid.z * 0.65;
+        let caustic = pow(max(0.5 + 0.5 * sin(caustic_phase), 0.0), 7.0) *
+                      exp(-camera_depth * 0.026) * smoothstep(0.32, 0.92, upward);
+        let deep = vec3<f32>(0.006, 0.045, 0.075);
+        let shallow = vec3<f32>(0.075, 0.315, 0.385);
+        let surface_light = vec3<f32>(0.300, 0.690, 0.710);
+        var underwater = mix(shallow, deep, clamp(depth_fade * 0.84 + horizontal_fog * depth_fade * 0.12, 0.0, 1.0));
+        underwater = mix(underwater, surface_light, upward * shallow_light * 0.88);
+        underwater += vec3<f32>(0.080, 0.205, 0.165) * caustic;
+        return vec4<f32>(underwater, 1.0);
+    }
     // Zero elevation is the horizon. Mapping dir.y into 0.5 at the horizon
     // caused the abrupt dark band in the previous gradient.
     let elevation = clamp(max(dir.y, 0.0), 0.0, 1.0);

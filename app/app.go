@@ -24,8 +24,8 @@ const (
 
 	hudX      = 16
 	hudY      = 16
-	hudWidth  = 640
-	hudHeight = 118
+	hudWidth  = 760
+	hudHeight = 142
 )
 
 const (
@@ -100,22 +100,29 @@ func Run(log *golog.Logger) error {
 				WithBackend(gogpu.BackendGo).WithFullscreen(),
 		)
 
-		start         time.Time = time.Now()
-		look          inputDeltaAccumulator
-		scroll        inputDeltaAccumulator
-		ctx           *gctx2d.Context
-		cam           *WaterCamera = NewWaterCamera()
-		renderer      *WaterRenderer
-		pointerSource gpucontext.PointerEventSource
-		scrollSource  interface{ OnScroll(func(float64, float64)) }
-		debugMode     int
-		shipAA        bool = os.Getenv("FFTWATER_SHIP_AA") != ""
-		aaToggle      atomic.Bool
-		lastAAToggle  atomic.Int64
-		captureDir    string = os.Getenv("FFTWATER_CAPTURE_DIR")
-		captureIndex  int
-		logFPS        bool = os.Getenv("FFTWATER_LOG_FPS") != ""
-		ok            bool
+		start               time.Time = time.Now()
+		look                inputDeltaAccumulator
+		scroll              inputDeltaAccumulator
+		ctx                 *gctx2d.Context
+		cam                 *WaterCamera = NewWaterCamera()
+		renderer            *WaterRenderer
+		pointerSource       gpucontext.PointerEventSource
+		scrollSource        interface{ OnScroll(func(float64, float64)) }
+		debugMode           int                   = debugModeFromEnvironment(os.Getenv("FFTWATER_DEBUG_MODE"))
+		shipAA              bool                  = os.Getenv("FFTWATER_SHIP_AA") != ""
+		shipReflections     ShipReflectionQuality = parseShipReflectionQuality(os.Getenv("FFTWATER_SHIP_REFLECTIONS"))
+		shipShadows         bool                  = os.Getenv("FFTWATER_SHIP_SHADOWS") != ""
+		aaToggle            atomic.Bool
+		reflectionCycle     atomic.Bool
+		shadowToggle        atomic.Bool
+		lastAAToggle        atomic.Int64
+		lastReflectionCycle atomic.Int64
+		lastShadowToggle    atomic.Int64
+		captureDir          string = os.Getenv("FFTWATER_CAPTURE_DIR")
+		captureLate         bool   = os.Getenv("FFTWATER_CAPTURE_LATE") != ""
+		captureIndex        int
+		logFPS              bool = os.Getenv("FFTWATER_LOG_FPS") != ""
+		ok                  bool
 	)
 	applyCameraOverride(cam, os.Getenv("FFTWATER_CAMERA"))
 
@@ -140,16 +147,25 @@ func Run(log *golog.Logger) error {
 	}
 
 	// Letter key codes are unreliable on some Wayland/XKB combinations. Text
-	// input preserves the user's actual "f" key and avoids the false toggles
-	// observed with raw key-code polling. The timestamp suppresses key repeat.
+	// input preserves the user's actual keys. Timestamps suppress key repeat.
 	gpuApp.EventSource().OnTextInput(func(text string) {
-		if text != "f" && text != "F" {
-			return
-		}
 		now := time.Now().UnixNano()
-		previous := lastAAToggle.Load()
-		if now-previous >= int64(300*time.Millisecond) && lastAAToggle.CompareAndSwap(previous, now) {
-			aaToggle.Store(true)
+		switch text {
+		case "f", "F":
+			previous := lastAAToggle.Load()
+			if now-previous >= int64(300*time.Millisecond) && lastAAToggle.CompareAndSwap(previous, now) {
+				aaToggle.Store(true)
+			}
+		case "r", "R":
+			previous := lastReflectionCycle.Load()
+			if now-previous >= int64(300*time.Millisecond) && lastReflectionCycle.CompareAndSwap(previous, now) {
+				reflectionCycle.Store(true)
+			}
+		case "q", "Q":
+			previous := lastShadowToggle.Load()
+			if now-previous >= int64(300*time.Millisecond) && lastShadowToggle.CompareAndSwap(previous, now) {
+				shadowToggle.Store(true)
+			}
 		}
 	})
 
@@ -175,6 +191,20 @@ func Run(log *golog.Logger) error {
 				renderer.SetShipAA(shipAA)
 			}
 			log.Infof("4x ship AA: %t\n", shipAA)
+		}
+		if reflectionCycle.Swap(false) {
+			shipReflections = (shipReflections + 1) % (ShipReflectionHigh + 1)
+			if renderer != nil {
+				renderer.SetShipReflectionQuality(shipReflections)
+			}
+			log.Infof("ship reflections: %s\n", shipReflections.Label())
+		}
+		if shadowToggle.Swap(false) {
+			shipShadows = !shipShadows
+			if renderer != nil {
+				renderer.SetShipShadows(shipShadows)
+			}
+			log.Infof("ship shadows: %t\n", shipShadows)
 		}
 
 		var dx, dy float32
@@ -251,6 +281,8 @@ func Run(log *golog.Logger) error {
 				log.Panicf("create water renderer: %v", err)
 			}
 			renderer.SetShipAA(shipAA)
+			renderer.SetShipReflectionQuality(shipReflections)
+			renderer.SetShipShadows(shipShadows)
 
 			log.Infof("GoGPU backend: %s\n", dc.Backend())
 		}
@@ -264,6 +296,9 @@ func Run(log *golog.Logger) error {
 		}
 
 		captureTimes := [...]float64{2.0, 4.0, 6.0}
+		if captureLate {
+			captureTimes = [...]float64{6.0, 12.0, 16.0}
+		}
 		if captureDir != "" && captureIndex < len(captureTimes) && elapsed >= captureTimes[captureIndex] {
 			path := filepath.Join(captureDir, fmt.Sprintf("fftwater-%02d.png", captureIndex+1))
 			if err = renderer.CapturePNG(path, frame); err != nil {
@@ -301,6 +336,11 @@ func Run(log *golog.Logger) error {
 			aaLabel = "4x"
 		}
 		ctx.FillText(fmt.Sprintf("Time: %.2fs   Height: %.2f   View: %s   Ship AA [F]: %s", elapsed, renderer.WaveHeightScale(), debugModeLabel(debugMode), aaLabel), hudX+12, hudY+100)
+		shadowLabel := "off"
+		if renderer.ShipShadowsEnabled() {
+			shadowLabel = "on"
+		}
+		ctx.FillText(fmt.Sprintf("Ship reflections [R]: %s   Ship shadows [Q]: %s", renderer.ShipReflectionQuality().Label(), shadowLabel), hudX+12, hudY+124)
 
 		if err = ctx.Flush(finalSurface, nil); err != nil {
 			log.Errorf("flush 2D HUD overlay: %v", err)
@@ -354,4 +394,25 @@ func applyCameraOverride(cam *WaterCamera, value string) {
 	cam.Position = Vec3{X: values[0], Y: values[1], Z: values[2]}
 	cam.Yaw = values[3]
 	cam.Pitch = clamp32(values[4], waterCameraMinPitch, waterCameraMaxPitch)
+}
+
+func debugModeFromEnvironment(value string) int {
+	mode, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || mode < debugModeFinal || mode >= debugModeCount {
+		return debugModeFinal
+	}
+	return mode
+}
+
+func parseShipReflectionQuality(value string) ShipReflectionQuality {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "low":
+		return ShipReflectionLow
+	case "2", "medium", "med":
+		return ShipReflectionMedium
+	case "3", "high":
+		return ShipReflectionHigh
+	default:
+		return ShipReflectionOff
+	}
 }

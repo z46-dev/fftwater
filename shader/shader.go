@@ -62,8 +62,8 @@ var OceanFoamHistoryWGSL string
 //go:embed ocean_variation.wgsl
 var OceanVariationWGSL string
 
-// OceanInteractionWGSL accumulates non-wrapping ship wake displacement,
-// Kelvin-wave slopes, propeller wash, and persistent interaction foam.
+// OceanInteractionWGSL stamps current hull/propeller disturbances into a
+// non-wrapping persistent field. Previous field contents form the wake trail.
 //
 //go:embed ocean_interaction.wgsl
 var OceanInteractionWGSL string

@@ -65,6 +65,14 @@ var variation_tex: texture_2d<f32>;
 // RG = interaction slope x/z, B = displacement height, A = wake foam.
 @group(0) @binding(7)
 var interaction_tex: texture_2d<f32>;
+// Screen-space planar ship reflection and projected shadow mask. Both targets
+// are transparent when their optional passes are disabled.
+@group(0) @binding(8)
+var ship_reflection_tex: texture_2d<f32>;
+@group(0) @binding(9)
+var ship_shadow_tex: texture_2d<f32>;
+@group(0) @binding(10)
+var interaction_sampler: sampler;
 
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
@@ -250,21 +258,36 @@ fn sample_variation_world(p: vec2<f32>, scale: f32, offset: vec2<f32>) -> vec4<f
 }
 
 fn sample_interaction_field(p: vec2<f32>) -> vec4<f32> {
-    let dims = textureDimensions(interaction_tex, 0);
     let span = 2560.0;
     let origin = frame.water_params1.zw;
     let uv = (p - origin) / span;
     if uv.x <= 0.0 || uv.y <= 0.0 || uv.x >= 1.0 || uv.y >= 1.0 {
         return vec4<f32>(0.0);
     }
-    let coord = uv * vec2<f32>(dims) - vec2<f32>(0.5);
+    return textureSampleLevel(interaction_tex, interaction_sampler, uv, 0.0);
+}
+
+// Optical interaction data must be sampled per fragment. Interpolating the
+// vertex sample over projected-grid triangles turns a narrow wake into large
+// polygons at distance. Average the linear field over the pixel footprint
+// before applying any nonlinear foam threshold, following the whitecap
+// prefiltering model.
+fn sample_interaction_footprint(p: vec2<f32>) -> vec4<f32> {
+    return sample_interaction_field(p);
+}
+
+fn sample_screen_texture(tex: texture_2d<f32>, pixel: vec2<f32>, screen_size: vec2<f32>) -> vec4<f32> {
+    let dims_u = textureDimensions(tex, 0);
+    let dims = vec2<i32>(dims_u);
+    let uv = clamp(pixel / max(screen_size, vec2<f32>(1.0)), vec2<f32>(0.0), vec2<f32>(0.999999));
+    let coord = uv * vec2<f32>(dims_u) - vec2<f32>(0.5);
     let i0 = vec2<i32>(floor(coord));
     let f = fract(coord);
-    let hi = vec2<i32>(dims) - vec2<i32>(1);
-    let a = textureLoad(interaction_tex, clamp(i0, vec2<i32>(0), hi), 0);
-    let b = textureLoad(interaction_tex, clamp(i0 + vec2<i32>(1, 0), vec2<i32>(0), hi), 0);
-    let c = textureLoad(interaction_tex, clamp(i0 + vec2<i32>(0, 1), vec2<i32>(0), hi), 0);
-    let d = textureLoad(interaction_tex, clamp(i0 + vec2<i32>(1, 1), vec2<i32>(0), hi), 0);
+    let hi = dims - vec2<i32>(1);
+    let a = textureLoad(tex, clamp(i0, vec2<i32>(0), hi), 0);
+    let b = textureLoad(tex, clamp(i0 + vec2<i32>(1, 0), vec2<i32>(0), hi), 0);
+    let c = textureLoad(tex, clamp(i0 + vec2<i32>(0, 1), vec2<i32>(0), hi), 0);
+    let d = textureLoad(tex, clamp(i0 + vec2<i32>(1, 1), vec2<i32>(0), hi), 0);
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
@@ -1071,7 +1094,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
     let rough_lift = clamp(wave_data.z * 0.030 + foam_history.z * 0.014, 0.0, 0.045) * field_weight;
     let crestlet_geo_gate = smoothstep(24.0, 74.0, base_view_distance) * (1.0 - smoothstep(980.0, 2200.0, base_view_distance));
     let geom_disp = shaped_direct.disp * (0.060 * direct_weight) + field.xz * (0.0016 * field_weight) + crestlets.disp * (0.006 * crestlet_geo_gate);
-    let geom_h = shaped_direct.height * (0.22 * direct_weight) + field.y * (0.0020 * field_weight * frame.water_params1.y) + rough_lift * 0.20 + crestlets.height * (0.12 * crestlet_geo_gate) + interaction.z * 0.72;
+    let geom_h = shaped_direct.height * (0.22 * direct_weight) + field.y * (0.0020 * field_weight * frame.water_params1.y) + rough_lift * 0.20 + crestlets.height * (0.12 * crestlet_geo_gate) + interaction.z * 1.15;
 
     let world = vec3<f32>(
         base_xz.x + geom_disp.x * edge_fade,
@@ -1129,15 +1152,20 @@ fn ocean_normal(world_pos: vec3<f32>, base_xz: vec2<f32>, wave_data: vec4<f32>, 
     return normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
 }
 
-fn crest_foam(view_distance: f32, foam_signal: f32, wave_data: vec4<f32>, foam_history: vec4<f32>, small_wave_detail: vec4<f32>, surface_variation: vec4<f32>) -> f32 {
+fn crest_foam(view_distance: f32, pixel_footprint: f32, foam_signal: f32, wave_data: vec4<f32>, foam_history: vec4<f32>, small_wave_detail: vec4<f32>, surface_variation: vec4<f32>) -> f32 {
     let short_energy = small_wave_detail.w;
     let short_crest = small_wave_detail.z;
     let detail_breaking = smoothstep(0.16, 0.62, short_energy) * smoothstep(0.018, 0.18, short_crest);
 
     let broad_breakup = smoothstep(0.30, 0.84, surface_variation.b * 0.68 + surface_variation.r * 0.32);
     let lace_gate = smoothstep(0.48, 0.91, surface_variation.a * 0.72 + surface_variation.g * 0.28);
-    let filament = mix(0.36, 1.0, broad_breakup) * mix(0.54, 1.20, lace_gate);
-    let distance_fade = 1.0 - smoothstep(1500.0, 3800.0, view_distance);
+    let detailed_filament = mix(0.36, 1.0, broad_breakup) * mix(0.54, 1.20, lace_gate);
+    // High-frequency lace becomes unresolved with distance. Preserve its mean
+    // fractional coverage instead of allowing a point sample to flicker or
+    // disappear.
+    let detail_filter = smoothstep(2.0, 14.0, pixel_footprint);
+    let filament = mix(detailed_filament, 0.72, detail_filter);
+    let distance_coverage = mix(1.0, 0.48, smoothstep(2600.0, 10500.0, view_distance));
 
     // wave_data and foam_history are already masked by expanded_field_support
     // in the vertex stage, so no second position-dependent gate is needed.
@@ -1145,11 +1173,11 @@ fn crest_foam(view_distance: f32, foam_signal: f32, wave_data: vec4<f32>, foam_h
     let moment_foam = smoothstep(0.14, 0.60, max(wave_data.z, foam_history.y)) * max(wave_data.w, foam_history.z * 0.42) * lowres_weight;
     let history_foam = foam_history.x * mix(0.32, 0.58, foam_history.w) * lowres_weight;
     let near_micro = 1.0 - smoothstep(220.0, 1300.0, view_distance);
-    let instant_foam = foam_signal * 0.10 + moment_foam * 0.09 +
-                       detail_breaking * (0.038 + near_micro * 0.034) +
-                       short_crest * (0.055 + near_micro * 0.044);
-    let crest_gate = smoothstep(0.018, 0.18, foam_signal + short_crest * 0.58 + moment_foam * 0.42);
-    return clamp((history_foam * 0.26 + instant_foam) * filament * crest_gate * distance_fade * frame.water_params0.z, 0.0, 0.30);
+    let instant_foam = foam_signal * 0.16 + moment_foam * 0.13 +
+                       detail_breaking * (0.060 + near_micro * 0.040) +
+                       short_crest * (0.075 + near_micro * 0.050);
+    let crest_gate = smoothstep(0.010, 0.125, foam_signal + short_crest * 0.66 + moment_foam * 0.50);
+    return clamp((history_foam * 0.34 + instant_foam) * filament * crest_gate * distance_coverage * frame.water_params0.z, 0.0, 0.38);
 }
 
 
@@ -1218,6 +1246,8 @@ fn water_volume_color(
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let cam = frame.camera_pos_fov.xyz;
+    let interaction_surface = sample_interaction_footprint(in.base_xz);
+    let pixel_footprint = max(length(dpdx(in.base_xz)), length(dpdy(in.base_xz)));
     var n = ocean_normal(in.world_pos, in.base_xz, in.wave_data, in.foam_history, in.small_wave_detail, in.view_distance, in.field_support, in.interaction.xy);
     // Beyond a few kilometers, projected wave normals become sub-pixel and
     // produce crawling lines near the horizon. Converge them toward a stable
@@ -1225,6 +1255,34 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let horizon_stabilize = smoothstep(2800.0, 10500.0, in.view_distance);
     n = normalize(mix(n, vec3<f32>(0.0, 1.0, 0.0), horizon_stabilize * 0.82));
     let view = normalize(cam - in.world_pos);
+    let camera_depth = frame.camera_forward_water.w - cam.y;
+    let debug_mode = i32(frame.water_params1.x + 0.5);
+    if camera_depth > 0.0 && debug_mode == 0 {
+        let underside_normal = -n;
+        let underside_n_dot_v = clamp(dot(underside_normal, view), 0.0, 1.0);
+        let underside_fresnel = 0.020 + 0.980 * pow(1.0 - underside_n_dot_v, 5.0);
+        let surface_variation = sample_variation_world(
+            in.base_xz,
+            0.012,
+            vec2<f32>(frame.resolution_time_grid.z * 0.025, -frame.resolution_time_grid.z * 0.018)
+        );
+        let ripple_light = smoothstep(
+            0.40,
+            0.92,
+            surface_variation.r * 0.54 + surface_variation.g * 0.30 + surface_variation.a * 0.16
+        );
+        let depth_attenuation = exp(-camera_depth * 0.012);
+        let surface_light = vec3<f32>(0.205, 0.555, 0.585) *
+                            (0.66 + ripple_light * 0.34) * depth_attenuation;
+        let deep_surface = vec3<f32>(0.012, 0.085, 0.125);
+        let depth_darkening = smoothstep(20.0, 240.0, camera_depth);
+        var underwater_surface = mix(surface_light, deep_surface, depth_darkening * 0.86);
+        underwater_surface += vec3<f32>(0.14, 0.30, 0.25) *
+                              pow(max(dot(underside_normal, normalize(vec3<f32>(0.42, -0.78, 0.46))), 0.0), 24.0) *
+                              depth_attenuation;
+        let underwater_alpha = clamp(0.34 + underside_fresnel * 0.22 + depth_darkening * 0.42, 0.34, 0.90);
+        return vec4<f32>(underwater_surface, underwater_alpha);
+    }
     let light = normalize(vec3<f32>(-0.42, 0.78, -0.46));
     let half_vec = normalize(light + view);
 
@@ -1248,7 +1306,45 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     );
     surface_variation = surface_variation * 0.5 + vec4<f32>(0.5);
     surface_variation = mix(surface_variation, vec4<f32>(0.5), horizon_stabilize);
-    let foam = clamp(crest_foam(in.view_distance, in.foam_signal, in.wave_data, in.foam_history, in.small_wave_detail, surface_variation) + in.interaction.w * 0.68, 0.0, 0.86);
+    let foam = clamp(crest_foam(in.view_distance, pixel_footprint, in.foam_signal, in.wave_data, in.foam_history, in.small_wave_detail, surface_variation), 0.0, 0.72);
+    let wake_density = 1.0 - exp(-max(interaction_surface.w, 0.0) * 3.4);
+    let wake_coverage = smoothstep(0.002, 0.080, wake_density);
+    let wake_flow = length(interaction_surface.xy);
+    let wake_pattern =
+        surface_variation.a * 0.30 +
+        surface_variation.b * 0.24 +
+        surface_variation.g * surface_variation.r * 0.28 +
+        abs(surface_variation.a - surface_variation.g) * 0.18;
+    let wake_breakup = smoothstep(0.28, 0.72, wake_pattern);
+    let wake_lace = smoothstep(
+        0.54,
+        0.84,
+        surface_variation.a * 0.44 + surface_variation.b * 0.28 +
+        surface_variation.g * 0.12 + wake_breakup * 0.16
+    );
+    // Height decays faster than foam, making it a useful freshness channel.
+    // Only newly deposited stern disturbance gets the bright spray treatment.
+    let wake_fresh = smoothstep(0.006, 0.035, abs(interaction_surface.z));
+    let wake_spray_seed = smoothstep(
+        0.74,
+        0.91,
+        surface_variation.a * 0.46 +
+        surface_variation.b * surface_variation.g * 0.34 +
+        surface_variation.r * 0.20
+    );
+    // Old wake energy resolves into contour rails and isolated foam cells.
+    // Avoid using density as direct opacity: doing that turns a persistent
+    // interaction field into a solid white ribbon.
+    let wake_rails = wake_coverage * smoothstep(0.004, 0.055, wake_flow) *
+                     mix(0.44, 1.0, wake_breakup);
+    let wake_cells = wake_coverage * wake_lace * wake_breakup *
+                     (1.0 - smoothstep(0.48, 0.88, wake_density));
+    let wake_surface = min(
+        wake_rails * 0.76 + wake_cells * 0.36,
+        1.0,
+    );
+    let wake_spray = wake_fresh * wake_coverage * wake_spray_seed;
+    let wake_churn = wake_coverage * mix(0.22, 0.64, wake_breakup);
     let height_t = clamp(in.field_height * 0.16 + 0.48, 0.0, 1.0);
     // Reuse normal derivatives and the animated material variation to expose
     // small folds and occasional micro-caps. No additional noise lookup is
@@ -1258,8 +1354,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
                       smoothstep(0.12, 0.72, geom_slope_mag) * near_micro;
     let cap_seed = surface_variation.a * 0.52 + surface_variation.b * 0.30 +
                    surface_variation.r * 0.18;
-    let micro_caps = smoothstep(0.72, 0.93, cap_seed) * fold_detail *
-                     smoothstep(0.42, 0.78, height_t);
+    let cap_activity = smoothstep(0.006, 0.040, normal_fold) *
+                       smoothstep(0.070, 0.38, geom_slope_mag);
+    let micro_caps = smoothstep(0.62, 0.86, cap_seed) * cap_activity *
+                     smoothstep(0.46, 0.68, height_t);
 
     let horizon_sky = vec3<f32>(0.42, 0.61, 0.73);
 
@@ -1278,20 +1376,50 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let shadow_variation = mix(0.97, shadow_variation_raw, smoothstep(900.0, 2800.0, in.view_distance));
     let cloud_light_raw = mix(0.78, 1.08, smoothstep(0.20, 0.82, weather_variation.r * 0.68 + weather_variation.b * 0.32));
     let cloud_light = mix(cloud_light_raw, 0.94, horizon_stabilize);
-    let surface_shadow = rough_shadow * shadow_variation * trough_occlusion * cloud_light;
-    let volume = water_volume_color(n, view, light, in.view_distance, in.field_height, slope_mag, surface_shadow);
+    let screen_size = frame.resolution_time_grid.xy;
+    let shadow_pixel = in.position.xy + n.xz * vec2<f32>(8.0, -8.0);
+    let shadow_radius = 5.5;
+    var ship_shadow = 0.0;
+    if textureDimensions(ship_shadow_tex, 0).x > 1u {
+        ship_shadow =
+            sample_screen_texture(ship_shadow_tex, shadow_pixel, screen_size).a * 0.40 +
+            sample_screen_texture(ship_shadow_tex, shadow_pixel + vec2<f32>( shadow_radius, 0.0), screen_size).a * 0.15 +
+            sample_screen_texture(ship_shadow_tex, shadow_pixel + vec2<f32>(-shadow_radius, 0.0), screen_size).a * 0.15 +
+            sample_screen_texture(ship_shadow_tex, shadow_pixel + vec2<f32>(0.0,  shadow_radius), screen_size).a * 0.15 +
+            sample_screen_texture(ship_shadow_tex, shadow_pixel + vec2<f32>(0.0, -shadow_radius), screen_size).a * 0.15;
+    }
+    let ship_shadow_light = 1.0 - ship_shadow * 0.40;
+    let body_light = rough_shadow * shadow_variation * trough_occlusion * cloud_light;
+    let volume = water_volume_color(n, view, light, in.view_distance, in.field_height, slope_mag, body_light);
 
     let refl_dir = reflect(-view, n);
 
     let roughness_grain = surface_variation.g;
     let local_roughness = clamp(0.31 + slope_mag * 0.20 + material_roughness * 0.46 + in.foam_history.z * 0.12 +
-                                foam * 0.38 + fold_detail * 0.045 +
+                                foam * 0.38 + fold_detail * 0.045 + wake_churn * 0.15 +
                                 (roughness_grain - 0.5) * 0.12, 0.27, 0.90);
     let roughness = mix(local_roughness, 0.74, horizon_stabilize);
     let env_dir = normalize(mix(refl_dir, vec3<f32>(refl_dir.x, max(refl_dir.y, 0.12), refl_dir.z), roughness * 0.25));
     var sky = skybox_color_from_dir(env_dir, roughness, in.base_xz);
     sky = max((sky - vec3<f32>(0.035, 0.045, 0.050)) * mix(1.18, 0.88, roughness), vec3<f32>(0.0));
     sky *= mix(0.46, 0.78, 1.0 - roughness) * mix(0.86, 1.02, cloud_light);
+    let reflection_pixel = in.position.xy + vec2<f32>(n.x, -n.z) * mix(3.0, 14.0, 1.0 - roughness);
+    var ship_reflection = vec4<f32>(0.0);
+    if textureDimensions(ship_reflection_tex, 0).x > 1u {
+        let filter_radius = mix(1.0, 4.4, roughness);
+        let reflection_a = sample_screen_texture(ship_reflection_tex, reflection_pixel, screen_size);
+        let reflection_b = sample_screen_texture(ship_reflection_tex, reflection_pixel + vec2<f32>(0.0, filter_radius), screen_size);
+        let reflection_c = sample_screen_texture(ship_reflection_tex, reflection_pixel - vec2<f32>(0.0, filter_radius), screen_size);
+        let reflection_d = sample_screen_texture(ship_reflection_tex, reflection_pixel + vec2<f32>(filter_radius, 0.0), screen_size);
+        let reflection_e = sample_screen_texture(ship_reflection_tex, reflection_pixel - vec2<f32>(filter_radius, 0.0), screen_size);
+        ship_reflection = reflection_a * 0.44 + (reflection_b + reflection_c + reflection_d + reflection_e) * 0.14;
+    }
+    let reflection_coherence = 1.0 - smoothstep(0.16, 0.72, slope_mag);
+    let reflection_breakup = mix(0.62, 1.0, smoothstep(0.24, 0.78, surface_variation.g));
+    let ship_reflection_weight = ship_reflection.a * reflection_coherence * (1.0 - roughness) *
+                                 reflection_breakup * (0.20 + fresnel * 0.58) *
+                                 (1.0 - foam * 0.88) * (1.0 - wake_churn * 0.72) *
+                                 ship_shadow_light;
     let spec_power = mix(220.0, 30.0, roughness);
     let wind_grain = surface_variation.r;
     let glitter_grain = surface_variation.a;
@@ -1303,7 +1431,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
                      sparkle_mask * (0.14 + fold_detail * 0.08);
     let fold_sheen = pow(n_dot_h, mix(150.0, 52.0, roughness)) *
                      fold_detail * (0.018 + micro_caps * 0.030);
-    let specular = (sun_sheen + sun_glints + fold_sheen) * n_dot_l * (1.0 - foam * 0.92);
+    let specular = (sun_sheen + sun_glints + fold_sheen) * n_dot_l *
+                   (1.0 - foam * 0.92) * (1.0 - wake_churn * 0.58) *
+                   ship_shadow_light;
 
     // PMREM-like behavior: rough water reflects a darker, blurrier sky while
     // crest/slope-facing facets pick up more sky contrast.  This is the first
@@ -1311,12 +1441,38 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let moment_fresnel = smoothstep(900.0, 5200.0, in.view_distance) * material_roughness * 0.08;
     let reflection_strength = clamp(fresnel * mix(0.40, 0.67, 1.0 - roughness) + moment_fresnel * 0.10, 0.010, 0.58);
     var color = volume * (1.0 - fresnel * 0.72) + sky * reflection_strength;
+    color = mix(color, ship_reflection.rgb, clamp(ship_reflection_weight, 0.0, 0.58));
     color += specular * vec3<f32>(0.88, 0.90, 0.84);
 
-    let foam_color = vec3<f32>(0.54, 0.58, 0.53) * (0.72 + n_dot_l * 0.28);
-    let cap_color = vec3<f32>(0.62, 0.70, 0.70) * (0.78 + n_dot_l * 0.22);
-    color = mix(color, foam_color, foam);
-    color = mix(color, cap_color, micro_caps * 0.085);
+    let foam_color = vec3<f32>(0.69, 0.73, 0.68) * (0.72 + n_dot_l * 0.28);
+    let cap_color = vec3<f32>(0.72, 0.78, 0.76) * (0.78 + n_dot_l * 0.22);
+    let whitecap_seed = surface_variation.b * 0.46 + surface_variation.a * 0.34 + surface_variation.r * 0.20;
+    let whitecap_lace = mix(
+        smoothstep(0.50, 0.76, whitecap_seed),
+        0.34,
+        smoothstep(2.0, 14.0, pixel_footprint)
+    );
+    let resolved_crest = smoothstep(0.006, 0.045, normal_fold) *
+                         smoothstep(0.060, 0.34, geom_slope_mag);
+    let foam_coverage = (1.0 - exp(-foam * 4.0)) * resolved_crest *
+                        whitecap_lace * ship_shadow_light;
+    color = mix(color, foam_color, foam_coverage * 0.92);
+    color = mix(color, cap_color, micro_caps * 0.18);
+
+    // WoWS treats deformation, surface foam, subsurface foam, and ship VFX as
+    // separate layers. The deformation interior therefore changes roughness
+    // and reflection, while foam is concentrated on broken boundaries and
+    // fresh stern spray instead of filling the whole density mask.
+    let wake_distance_fade = 1.0 - smoothstep(2200.0, 7200.0, in.view_distance);
+    let wake_shadow = mix(0.32, 1.0, ship_shadow_light);
+    let wake_surface_amount = wake_surface * wake_distance_fade * wake_shadow;
+    let wake_spray_amount = wake_spray * wake_distance_fade * wake_shadow;
+    let wake_color = vec3<f32>(0.87, 0.90, 0.84) * (0.70 + n_dot_l * 0.30);
+    let spray_color = vec3<f32>(0.95, 0.97, 0.92) * (0.76 + n_dot_l * 0.24);
+    let churn_color = color * vec3<f32>(0.92, 0.98, 1.015) + vec3<f32>(0.004, 0.015, 0.020);
+    color = mix(color, churn_color, wake_churn * wake_distance_fade * 0.035);
+    color = mix(color, wake_color, clamp(wake_surface_amount * 0.50, 0.0, 0.50));
+    color = mix(color, spray_color, clamp(wake_spray_amount * 0.58, 0.0, 0.58));
 
     let aerial = smoothstep(3000.0, 12500.0, in.view_distance);
     color = mix(color, horizon_sky, aerial * 0.46);
@@ -1334,10 +1490,12 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let shadow_lift = 1.0 - smoothstep(0.12, 0.54, display_luma);
     color += vec3<f32>(0.105, 0.174, 0.218) * shadow_lift;
 
-    let debug_mode = i32(frame.water_params1.x + 0.5);
     if debug_mode != 0 {
         return vec4<f32>(debug_visualize(debug_mode, in, n, slope_mag, roughness, foam), 1.0);
     }
 
-    return vec4<f32>(color, 1.0);
+    // Keep enough transmission for the surface to feel like water instead of
+    // painted metal. Foam and grazing-angle Fresnel naturally close it back up.
+    let water_alpha = clamp(0.90 + fresnel * 0.065 + foam * 0.055, 0.90, 0.995);
+    return vec4<f32>(color, water_alpha);
 }
